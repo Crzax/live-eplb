@@ -12,7 +12,8 @@ pseudo-code, no placeholder results.
 
 ## Stage 1 — Bounded incremental planner — DONE
 
-`live_eplb/planner.py`, `tutorials/01_eplb_diff.py`, `tests/test_planner.py` (13/13).
+`live_eplb/planner.py`, `tutorials/01_eplb_diff.py`, `tutorials/01b_ablation.py`,
+`tests/test_planner.py` (14/14).
 
 Results and reasoning: see `README.md` and `docs/stage1_debug_notes.md`.
 
@@ -26,6 +27,13 @@ Key findings:
   load worse than doing nothing (measured 1.062 vs 1.000).
 - At most one replica of an expert per rank; more replicas on the same rank carry the same total
   load and only waste slots.
+- The greedy must also respect each rank's slot capacity. Tracking "does rank r already hold e"
+  is not enough: without a free-slot check the search assigned 7 replicas to a rank with 4 slots
+  and the assembly step silently truncated them, so the planner optimised a layout it never
+  emitted. All 13 tests passed; only the equal-budget ablation exposed it.
+- Equal-budget ablation: restricted to the same 32 redundant slots, the official replica rule
+  reaches 1.166 while the peak-driven greedy reaches 1.108. The remaining gap to the
+  unconstrained 1.000 is the price of the constraint, not a weaker algorithm.
 
 ## Stage 2 — CUDA Graph in-place weight swap (single GPU)
 

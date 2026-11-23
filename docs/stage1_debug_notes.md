@@ -235,17 +235,133 @@ assert torch.allclose(l1.sum(-1), l0.sum(-1), rtol=1e-5)   # 总负载守恒
 
 ---
 
-## 三个 bug 的共性
+## Bug 4：容量约束没进贪心 —— 只有消融实验能发现
+
+### 发现过程
+
+这个 bug 不是测试发现的，是**跑同等预算对比实验时**发现的。
+
+实验 B 的设计是：让官方规则（`argmax(w/c)` + 最空的卡）在我们的 Pinned-Base 约束下运行，
+看同样预算下谁更好。预期是我们的峰值驱动不会差太多。结果：
+
+```
+Official rule under Pinned-Base         1.166
+Ours (peak-driven) under Pinned-Base    1.359    <== 明显更差
+```
+
+我们输了 16%。这不符合预期——峰值驱动直接优化目标函数，不该输给启发式规则。
+
+### 定位
+
+打印每张卡实际分到的副本数：
+
+```
+rank0: 1 extra (cap 4)
+rank1: 7 extra (cap 4)  <== OVERFLOW, 3 dropped!
+rank2: 2 extra (cap 4)
+rank3: 7 extra (cap 4)  <== OVERFLOW, 3 dropped!
+rank4: 3 extra (cap 4)
+rank5: 6 extra (cap 4)  <== OVERFLOW, 2 dropped!
+rank6: 0 extra (cap 4)
+rank7: 4 extra (cap 4)
+```
+
+贪心给 rank1 分了 **7 个副本，而每卡只有 4 个冗余槽**。
+
+### 根因
+
+贪心循环只检查了"这张卡是否已持有该专家"：
+
+```python
+peak[holds.T] = np.inf      # rank already has e
+```
+
+**没有检查这张卡还有没有空槽。** 于是它可以无限往同一张卡上堆副本。
+
+而组装阶段用切片**静默截断**：
+
+```python
+extra = [e for e in np.flatnonzero(holds[r]) if not r * epr <= e < (r + 1) * epr]
+for i, e in enumerate(extra[:red]):     # <== 超出 red 的被丢弃，无任何提示
+    row[r * spr + epr + i] = int(e)
+```
+
+30 个副本里有 8 个被丢掉。贪心的内部状态（`load`、`cnt`）是按"全部放进去"算的，
+但实际布局里它们不存在 —— **算法以为自己优化好了，实际没有。**
+
+### 为什么 13 个测试全过
+
+因为**产出的布局完全合法**：
+
+| 测试 | 为什么过了 |
+|---|---|
+| `test_base_slots_frozen` | base 槽确实没动 |
+| `test_no_duplicate_on_rank` | 丢弃后反而不可能重复 |
+| `test_inverse_consistency` | `log2phy` 是从最终 `phy2log` 反推的，自然一致 |
+| `test_copy_tasks_are_valid` | `dst_slot` 都在 `[32, 36)` 内，没有越界 |
+| `test_improves_imbalance` | 2.369 → 1.359 **确实改善了 43%**，远超 25% 的阈值 |
+
+最关键的是 `test_improves_imbalance` 也过了 —— 结果虽然次优，但确实变好了。
+这个测试只能发现"完全没效果"（Bug 3），发现不了"效果只有一半"。
+
+### 修复
+
+在贪心里跟踪剩余容量，满了的卡不再作为候选：
+
+```python
+free = np.full(num_ranks, red, dtype=np.int64)    # [R] 每卡剩余冗余槽
+...
+    peak[holds.T] = np.inf                        # rank already has e
+    peak[:, free == 0] = np.inf                   # rank has no free slot
+...
+    free[r] -= 1
+```
+
+并在组装处加断言，防止同类 bug 再次静默发生：
+
+```python
+assert len(extra) <= red, f"rank {r} overflowed: {len(extra)} > {red}"
+```
+
+修复后：
+
+```
+Official rule under Pinned-Base         1.166
+Ours (peak-driven) under Pinned-Base    1.108    <== 现在更好
+```
+
+主实验的 Max/Mean 从 1.359 降到 **1.108**，MaxLoad 从 8336 降到 6796（与官方 6037 只差 12.6%）。
+
+### 教训
+
+**"合法"和"最优"之间还有很大空间，而测试通常只能验证前者。**
+
+前三个 bug 都能被"更好的测试"抓到，这个不行 —— 要发现它，必须有一个**外部参照物**。
+实验 B 的价值就在这里：它不是为了调试，而是为了回答"差距来自约束还是算法"这个设计问题，
+顺带暴露了实现缺陷。
+
+由此多一条经验：**凡是"先在内部状态里记账，再写到输出结构"的代码，都要检查两者的约束是否一致。**
+`holds` 是无界的（bool 矩阵，爱放多少放多少），`row` 是有界的（每卡 4 个槽），
+这个不匹配就是 bug 的温床。加断言是最低成本的防线。
+
+---
+
+## 四个 bug 的共性
 
 | | 会不会报错 | 结构测试能否发现 | 靠什么发现的 |
 |---|---|---|---|
 | Bug 1 正反馈 | 否 | 否 | 专门的退化场景测试（均匀负载） |
 | Bug 2 槽号 | 会（越界） | **能** | 接口约定断言 |
-| Bug 3 peak | 否 | 否 | 端到端指标异常 |
+| Bug 3 peak | 否 | 否 | 端到端指标异常（完全没效果） |
+| Bug 4 容量溢出 | 否 | 否 | **对照实验**（效果只有一半） |
 
-两个最严重的（1 和 3）都是"安静地给出错误答案"，而且都是**优化目标没对齐**导致的：
-Bug 1 用代理指标替代目标函数，Bug 3 算错了目标函数本身。
+四个里有三个是"安静地给出错误答案"。Bug 1 和 Bug 3 是**优化目标没对齐**
+（用代理指标替代目标函数 / 算错了目标函数本身），Bug 4 是**内部状态与输出结构的约束不一致**。
 
-所以 Stage 2 之后的测试策略定为：**每个 Stage 至少有一条测试直接断言"这个优化真的生效了"，
-而不只是"没有崩"。** 比如 Stage 2 要断言换权后的输出命中手算期望值，
-而不是只断言 `replay()` 没抛异常。
+所以 Stage 2 之后的测试策略定为三层：
+1. **结构层** —— shape、映射互逆、字段合法（能抓 Bug 2 这类）
+2. **效果层** —— 至少一条测试断言"这个优化真的生效了"，和基线对比（能抓 Bug 3）
+3. **对照层** —— 关键阶段要有一个独立实现或已知最优作为参照物（才能抓 Bug 4）
+
+比如 Stage 2 要断言换权后的输出命中**图外手算的期望值**，而不是只断言 `replay()` 没抛异常。
+手算结果就是那个"对照层"的参照物。

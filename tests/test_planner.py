@@ -145,6 +145,27 @@ def test_single_hot_expert_rank_bound():
     assert len(tasks) <= R * RED
 
 
+def test_rank_capacity_respected():
+    """Regression: the greedy must stop offering a rank once its redundant slots are full.
+
+    An earlier version only checked "does this rank already hold e" and happily
+    assigned 7 replicas to a rank with 4 slots; the assembly step then silently
+    truncated them, so the planner optimised a layout it did not actually emit.
+    """
+    for alpha, seed in [(0.8, 0), (1.1, 1), (2.0, 2)]:
+        w = skewed(8, alpha=alpha, seed=seed)
+        phy2log, _, logcnt, _ = plan_incremental_redundant(w)
+        for l in range(w.shape[0]):
+            for r in range(R):
+                block = [int(v) for v in phy2log[l, r * SPR:(r + 1) * SPR]]
+                base = set(range(r * EPR, (r + 1) * EPR))
+                extra = [e for e in block if e >= 0 and e not in base]
+                assert len(extra) <= RED, (
+                    f"alpha={alpha} layer {l} rank {r}: {len(extra)} extras > {RED}")
+        # every replica counted in logcnt must exist in the layout
+        assert int(logcnt.sum()) == int((phy2log >= 0).sum())
+
+
 def test_shape_mismatch_raises():
     try:
         plan_incremental_redundant(torch.ones(2, E - 1))

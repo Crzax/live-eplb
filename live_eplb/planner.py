@@ -88,6 +88,7 @@ def _plan_layer(w: np.ndarray, num_ranks: int, epr: int, red: int) -> List[int]:
     for r in range(num_ranks):
         holds[r, r * epr:(r + 1) * epr] = True
     load = holds.astype(np.float64) @ w               # [R] current load per rank
+    free = np.full(num_ranks, red, dtype=np.int64)    # [R] redundant slots left per rank
 
     for _ in range(num_ranks * red):
         cur_max = load.max()                                     # scalar
@@ -99,6 +100,7 @@ def _plan_layer(w: np.ndarray, num_ranks: int, epr: int, red: int) -> List[int]:
         # peak[e, r] = global max rank load if e's new replica lands on rank r
         peak = np.maximum(after_max[:, None], after + add[:, None])   # [E, R]
         peak[holds.T] = np.inf                                   # rank already has e
+        peak[:, free == 0] = np.inf                              # rank has no free slot
         flat = int(np.argmin(peak))                              # scalar, index into [E, R]
         e, r = divmod(flat, num_ranks)
         if not np.isfinite(peak[e, r]) or peak[e, r] >= cur_max - 1e-9:
@@ -107,12 +109,14 @@ def _plan_layer(w: np.ndarray, num_ranks: int, epr: int, red: int) -> List[int]:
         load[r] += add[e]
         holds[r, e] = True
         cnt[e] += 1
+        free[r] -= 1
 
     row = [-1] * (num_ranks * spr)
     for r in range(num_ranks):
         row[r * spr:r * spr + epr] = list(range(r * epr, (r + 1) * epr))
         extra = [e for e in np.flatnonzero(holds[r]) if not r * epr <= e < (r + 1) * epr]
-        for i, e in enumerate(extra[:red]):
+        assert len(extra) <= red, f"rank {r} overflowed: {len(extra)} > {red}"
+        for i, e in enumerate(extra):
             row[r * spr + epr + i] = int(e)
     return row
 

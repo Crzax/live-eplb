@@ -1,115 +1,226 @@
 # LiveEPLB
 
-MoE expert live migration for 8-way expert parallelism: **bounded-migration planning** plus
-(work in progress) CUDA Graph in-place weight swap without re-capture.
+A from-scratch MoE expert live-migration engine: bounded-volume rebalancing with in-place CUDA
+Graph weight swap.
 
-Target model: `Qwen/Qwen3.6-35B-A3B` — 40 MoE layers, 256 routed experts, top-8 routing,
-`moe_intermediate_size=512`. One routed expert is `3 * 2048 * 512 = 3.15M` params = **6.29 MB** in BF16.
+When a Mixture-of-Experts model is served with expert parallelism, each GPU owns a slice of the
+experts. Real request traffic is long-tailed — a handful of experts absorb most of the tokens — so
+the GPU holding them becomes the bottleneck for the entire batch while its peers idle. The standard
+fix is to replicate hot experts into spare slots and periodically recompute the placement. DeepSeek
+published [EPLB](https://github.com/deepseek-ai/EPLB), which answers *where every expert should go*.
 
----
+It does not answer *how to get there without stopping inference*. Two costs appear the moment you
+try to apply a new placement online. First, the new layout bears no resemblance to the old one, so
+almost every expert's weights must be copied across GPUs. Second, a CUDA Graph freezes every kernel
+argument — including weight pointers — at capture time, so pointing the model at relocated weights
+forces a graph re-capture. Both happen while the engine is stopped, and both show up as a latency
+spike for whoever is being served at that moment.
 
-## The problem
+LiveEPLB attacks the first cost by constraining the planner so that migration volume has a hard
+upper bound, and the second by never moving a pointer at all.
 
-DeepSeek's [EPLB](https://github.com/deepseek-ai/EPLB) answers *where experts should go*, but not
-*how to get there without stopping inference*. Its objective function contains only the balance of
-the current snapshot — there is no term for "difference from the previous layout". Every call is
-solved as a fresh cold-start problem, so the solution is discontinuous: a small change in load
-produces a completely different placement.
-
-Measured on layer 0 / GPU 0 after the hot expert set rotates by 64 experts:
+## Architecture
 
 ```
-t0: [138,  9, 86, 105, 253, 214, 251, 80, 67, 64, ...]
-t1: [ 68, 68, 31, 160, 163, 219, 153, 118, 58, 77, ...]
+                        load statistics (EMA, all-reduced)
+                                      |
+                                      v
+                        +---------------------------+
+                        |   Pinned-Base planner     |   deterministic, runs on
+                        |   (live_eplb/planner.py)  |   every rank independently
+                        +---------------------------+
+                                      |
+                       copy_tasks: only redundant slots
+                                      |
+       +------------------------------+------------------------------+
+       |                              |                              |
+       v                              v                              v
+  +---------+                    +---------+                    +---------+
+  | GPU 0   |                    | GPU 1   |       ...          | GPU 7   |
+  |         |   NVLink P2P       |         |                    |         |
+  | W_pool  |<------------------>| W_pool  |<------------------>| W_pool  |
+  | [36,..] |  transfer_stream   | [36,..] |                    | [36,..] |
+  +---------+                    +---------+                    +---------+
+    0..31  base slots   frozen, read-only for the whole service lifetime
+    32..35 redundant    the only slots the planner may touch
+
+  compute_stream:  graph.replay()  ->  slot = log2phy[expert, cursor % logcnt[expert]]
+                                       matmul with W_pool[slot]
+  transfer_stream: cudaMemcpyPeerAsync into W_pool[32..35]  ->  event.record()
 ```
 
-All 36 slots changed. Globally 11520 of 11520 slots move — 70.8 GB of expert weights.
+The forward pass reads a *routing table* instead of a weight pointer. `W_pool` and `log2phy` are
+allocated once and never reallocated, so the addresses baked into the captured graph stay valid
+forever. Swapping an expert means writing bytes into a slot and then writing a new slot index into
+the table — the graph never notices.
 
-That is acceptable for the original setting (offline / low-frequency reconfiguration, roughly every
-10 minutes). It is not acceptable for online adjustment every few dozen decode steps.
+## Key design decisions
 
-> Note: the `torch.arange` initialisation inside the official `replicate_experts` is only an
-> intermediate value. `balanced_packing` in step 3 sorts by load and re-packs everything, so the
-> final layout has nothing to do with "the first N experts stay put".
+- **Pinned-Base layout** — GPU `r` permanently owns logical experts `[32r, 32r+32)`. Only the 4
+  trailing redundant slots per GPU are planned, so migration volume is bounded by 32 slots per
+  layer regardless of how traffic changes.
+- **Peak-driven greedy** — a replica is placed only if it lowers the *global maximum rank load*.
+  Under uniform traffic no candidate qualifies and nothing is copied, which is correct: replication
+  cannot help a balanced distribution.
+- **Constant copy sources** — expert `e` always has its base replica at rank `e // 32`, slot
+  `e % 32`. No lookup, and no circular dependency between moves, so no staging buffer is needed to
+  break cycles.
+- **Empty slots receive no tokens** — an unused redundant slot holds `-1` and is unreachable from
+  the routing table, so writing weights into it needs no mutual exclusion with the forward pass.
+- **Base weights are read-only** for the entire service lifetime, which shrinks the window where a
+  read could race a write from 100% of slots to 11%.
+- **Deterministic planning** — identical statistics produce an identical plan, so all 8 ranks can
+  plan independently and skip broadcasting the placement; only the load statistics need an
+  all-reduce.
+- **No atomics in the commit kernel** — kernels on one stream are ordered, so "replay sees a
+  complete table" follows from stream ordering plus event sync. Atomics would only cost speed.
 
-## The approach: Pinned-Base
+## Modules
 
-Freeze the base slots. GPU `r` permanently owns logical experts `[32r, 32r+32)`. Only the trailing
-4 redundant slots per GPU are planned, so:
+| Path | Role |
+|---|---|
+| `live_eplb/planner.py` | Pinned-Base bounded planner: placement, inverse routing tables, copy-task diff |
+| `live_eplb/eplb_official.py` | DeepSeek EPLB, vendored verbatim, used only as the comparison baseline |
+| `tutorials/01_eplb_diff.py` | Official full reshuffle vs bounded incremental planning |
+| `tutorials/01b_ablation.py` | Skew sweep, and the same-budget constraint-vs-algorithm ablation |
+| `tests/test_planner.py` | 14 invariant tests |
+| `live_eplb/moe_layer.py` | *(stage 2)* EP=8 MoE layer with address-pinned `W_pool` / `log2phy` |
+| `csrc/p2p_swapper.cu` | *(stage 3)* CUDA IPC handles, `cudaMemcpyPeerAsync`, routing-table commit |
+| `live_eplb/controller.py` | *(stage 4)* async state machine, IDLE -> COPYING -> COMMIT |
 
-- **migration volume has a hard upper bound** of 32 slots per layer, independent of traffic shape;
-- the source address of every copy is a constant (`src_rank = e // 32`, `src_slot = e % 32`),
-  so no lookup and no circular dependency between moves;
-- base weights are read-only for the whole service lifetime, and empty redundant slots receive no
-  tokens — writing into them needs no mutual exclusion with the forward pass.
+## Installation
 
-The cost is a lower ceiling on balance: an expert can have at most 8 replicas (one per GPU), so
-perfect balance is unreachable.
-
-## Stage 1 results
-
-40 layers x 256 experts, Zipf(alpha=1.1) load, hot set rotated by 64 experts between snapshots:
-
-| policy | Max/Mean | MaxLoad | plan ms | slots moved | base moved | GB copied |
-|---|---|---|---|---|---|---|
-| Static EP (no balancing) | 2.369 | 14584 | 0.0 | 0 | 0 | 0.00 |
-| Official EPLB (reshuffle) | **1.000** | 6136 | 443.4 | 11520 | 0 | 70.78 |
-| LiveEPLB (incremental) | 1.359 | 8336 | 187.9 | **1069** | **0** | **6.57** |
-
-**10.8x less data moved, zero base-slot churn, at the cost of Max/Mean 1.00 -> 1.36.**
-
-This is a trade-off, not a strict improvement. The official policy is free to pack any expert
-anywhere and reaches the theoretical optimum; we deliberately give that up for boundedness.
+Stage 1 is pure Python and needs no GPU:
 
 ```bash
-python tutorials/01_eplb_diff.py          # reproduce the table
-python tests/test_planner.py              # 13 invariant tests
+git clone https://github.com/Crzax/live-eplb.git
+cd live-eplb
+pip install torch numpy
 ```
+
+> Requires Python >= 3.10 and PyTorch >= 2.1. Later stages additionally need CUDA >= 12.0 with
+> `nvcc` on `PATH`, and 8 NVLink-connected GPUs for the full benchmark.
+
+## Quick Start
+
+```bash
+python tutorials/01_eplb_diff.py
+```
+
+```
+Qwen3.6-35B-A3B: 40 MoE layers x 256 experts, EP=8, 32 base + 4 redundant slots/rank = 288 physical slots
+expert slot = 6.29 MB BF16; traffic Zipf(alpha=1.1), hot set rotates by 64 experts between snapshots
+
+policy                        Max/Mean    MaxLoad   plan ms  slots moved  base moved  GB copied
+-----------------------------------------------------------------------------------------------
+Static EP (no balancing)         2.369      14584       0.0            0           0       0.00
+Official EPLB  plan@t0           1.000       6037     450.3            0           0       0.00
+Official EPLB  reshuffle         1.000       6136     449.7        11520           0      70.78
+LiveEPLB       plan@t0           1.090       6570     188.3            0           0       0.00
+LiveEPLB       incremental       1.108       6796     188.9          984           0       6.05
+
+--- copy plan for the traffic shift (snapshot t0 -> t1) ---
+LiveEPLB :   984 tasks, 6.05 GB  (77% of redundant slots)
+Official : 11520 tasks, 70.78 GB  (full reshuffle)
+
+correctness: every expert reachable, per-layer token count conserved [OK]
+```
+
+Then the ablations, and the tests:
+
+```bash
+python tutorials/01b_ablation.py
+python tests/test_planner.py
+```
+
+## The trade-off
+
+The planner is not strictly better than the official one — it occupies a different point:
+
+```
+Official EPLB:  optimal balance  +  unbounded migration  +  needs cycle-breaking buffers
+LiveEPLB:       near balance     +  bounded migration    +  copies are independent writes
+```
+
+Concretely, at `alpha = 1.1`:
+
+| | Official | LiveEPLB |
+|---|---|---|
+| Max/Mean | **1.000** | 1.108 |
+| data moved per shift | 70.78 GB | **6.05 GB** |
+| worst-case volume | unbounded (full reshuffle) | **7.86 GB, traffic-independent** |
+| planning time | 450 ms | **188 ms** |
+
+**11.7x less data moved for 10.8% worse balance.** And the balance gap is caused by the constraint,
+not by a weaker algorithm — running the official replica-selection rule inside the same Pinned-Base
+budget yields 1.166, which our peak-driven greedy beats at 1.108. Full numbers and methodology in
+[`docs/stage1_experiments.md`](docs/stage1_experiments.md).
+
+Why bounding matters more than averaging: the official policy's cost depends on traffic shape, and
+its worst case is a complete reshuffle. xLLM carries an explicit code path for "changed slots >=
+half", which implies that case occurs in production. Our cost is a constant you can put in a
+latency budget.
 
 ## Status
 
 | Stage | Scope | State |
 |---|---|---|
 | 1 | Bounded incremental planner vs official EPLB | **done** |
-| 2 | Single-GPU CUDA Graph in-place weight swap, zero re-capture | todo |
+| 2 | Single-GPU CUDA Graph in-place swap, zero re-capture | in progress |
 | 3 | CUDA IPC + `cudaMemcpyPeerAsync` NVLink P2P engine | todo |
-| 4 | Async state machine + 8xH20 TPOT benchmark | todo |
+| 4 | Async state machine + 8x H20 TPOT benchmark | todo |
 | 5 | Real router traces from Qwen3.6-35B-A3B | todo |
 
-## Layout
+Target model: `Qwen/Qwen3.6-35B-A3B` — 40 MoE layers, 256 routed experts, top-8 routing,
+`moe_intermediate_size=512`, plus 1 shared expert. One routed expert is
+`3 * 2048 * 512 = 3.15M` parameters, **6.29 MB** in BF16.
+
+## Project Structure
 
 ```
-live_eplb/
-  planner.py          Pinned-Base bounded planner
-  eplb_official.py    vendored DeepSeek EPLB, baseline only (MIT, see EPLB_LICENSE)
-tutorials/
-  01_eplb_diff.py     official full reshuffle vs bounded incremental
-tests/
-  test_planner.py     13 invariant tests
-docs/
-  stage1_debug_notes.md   three real bugs and what caught them
+live-eplb/
+├── live_eplb/
+│   ├── planner.py              <- Pinned-Base planner, peak-driven greedy
+│   ├── eplb_official.py        <- vendored DeepSeek EPLB (MIT), baseline only
+│   └── EPLB_LICENSE
+├── tutorials/
+│   ├── 01_eplb_diff.py         <- main comparison, writes results/stage1_plans.pt
+│   └── 01b_ablation.py         <- alpha sweep + equal-budget ablation
+├── tests/
+│   └── test_planner.py         <- 14 invariant tests
+├── docs/
+│   ├── stage1_experiments.md   <- workload model, all measurements, limitations
+│   └── stage1_debug_notes.md   <- four real bugs and what caught each one
+└── ROADMAP.md                  <- per-stage specs and known pitfalls
 ```
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [`docs/stage1_experiments.md`](docs/stage1_experiments.md) | Zipf workload model, main comparison, two ablations, correctness checks, known limitations |
+| [`docs/stage1_debug_notes.md`](docs/stage1_debug_notes.md) | Four bugs found during Stage 1, including two that passed every structural test while silently producing wrong plans |
+| [`ROADMAP.md`](ROADMAP.md) | Technical spec for each stage, plus the pitfalls worth knowing before writing the code |
 
 ## Prior art
 
-This is not the first attempt at online expert rebalancing. Two systems solve the same problem:
+Online expert rebalancing is not a new idea, and two production systems solve the same problem:
 
-- **[vllm-ascend SwiftBalancer](https://github.com/vllm-project/vllm/issues/22246)** — moves the
-  EPLB algorithm, p2p op construction and log2phy conversion into a separate worker to hide ~1s of
-  host-bound latency; transfers weights on an async stream inside the gap between iterations.
-- **[xLLM EPLB](https://docs.xllm-ai.com/en/features/eplb/)** — keeps active tensor objects and
-  updates weights / `log2phy` in place so the ACL Graph address stays stable, therefore weight
-  switching does not trigger re-capture; two-phase prepare/activate state machine with a benefit
-  gate.
+- **[SwiftBalancer](https://github.com/vllm-project/vllm/issues/22246)** (vllm-ascend) moves the
+  EPLB algorithm, p2p op construction and `log2phy` conversion into a separate worker to hide ~1s of
+  host-bound latency, and transfers weights on an async stream inside the gap between iterations.
+- **[xLLM EPLB](https://docs.xllm-ai.com/en/features/eplb/)** keeps active tensor objects and
+  updates weights and `log2phy` in place so the ACL Graph's addresses stay stable, meaning a weight
+  switch does not trigger re-capture. It drives migration through a two-phase prepare/activate
+  state machine with a benefit gate.
 
-Both **recompute the global placement and then diff the changed slots**. Migration volume therefore
-depends on traffic characteristics — xLLM has an explicit branch for "changed slots >= half", which
-implies that case does occur in practice.
-
-LiveEPLB constrains the search space up front instead, which makes the worst case a constant and
-removes the need for staging buffers and a two-phase commit. The cost is quantified above.
+Both **recompute the global placement, then diff the changed slots** — migration volume is reduced
+after the fact, and therefore still depends on traffic. LiveEPLB constrains the search space before
+planning instead, which turns the worst case into a constant and removes the need for staging
+buffers and a two-phase commit. The price is the balance ceiling quantified above.
 
 ## License
 
-MIT. `live_eplb/eplb_official.py` is vendored from deepseek-ai/EPLB and remains under its original
-MIT license (`live_eplb/EPLB_LICENSE`).
+MIT. `live_eplb/eplb_official.py` is vendored from
+[deepseek-ai/EPLB](https://github.com/deepseek-ai/EPLB) and stays under its original MIT license
+(see `live_eplb/EPLB_LICENSE`).

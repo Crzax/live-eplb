@@ -41,11 +41,14 @@ def official(weight):
 
 
 def row(name, phy2log, weight, plan_s, prev=None, base_frozen=False):
+    """One table row. `changed` counts slots that need an actual weight copy:
+    a slot going from expert X to expert Y, or from empty to Y. A slot that
+    becomes empty (-1) costs nothing to "move", so it is excluded."""
     load = rank_load(phy2log, weight, RANKS)
     ratio = (load.max(-1).values / load.mean(-1)).mean().item()
     changed, base_changed = 0, 0
     if prev is not None:
-        diff = (phy2log != prev)
+        diff = (phy2log != prev) & (phy2log >= 0)
         changed = int(diff.sum().item())
         if base_frozen:
             for r in range(RANKS):
