@@ -9,11 +9,7 @@ CopyTask = Tuple[int, int, int, int, int, int]  # (layer, src_rank, src_slot, ds
 
 def static_phy2log(num_layers: int, num_ranks: int = 8, experts_per_rank: int = 32,
                    redundant_per_rank: int = 4) -> torch.Tensor:
-    """Baseline layout: rank r holds experts [r*epr, (r+1)*epr); redundant slots are -1.
-
-    Shapes:
-        return phy2log: [num_layers, num_ranks*(epr+red)] int64, slot -> expert (-1 = empty)
-    """
+    """Baseline layout -> [L, R*(epr+red)]: rank r holds [r*epr, (r+1)*epr), rest -1."""
     spr = experts_per_rank + redundant_per_rank
     phy2log = torch.full((num_layers, num_ranks * spr), -1, dtype=torch.int64)
     for r in range(num_ranks):
@@ -24,19 +20,12 @@ def static_phy2log(num_layers: int, num_ranks: int = 8, experts_per_rank: int = 
 
 def log2phy_from_phy2log(phy2log: torch.Tensor, num_experts: int
                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Invert the slot->expert table into the expert->slot table used at inference.
-
-    Shapes (L layers, S slots, E experts, C = max replicas of any expert):
-        phy2log: [L, S]       int64, slot -> expert (-1 = empty)
-        return:  [L, S]       int64, phy2log unchanged (pass-through for convenience)
-                 [L, E, C]    int32, log2phy, replica k of expert e -> slot (-1 = unused)
-                 [L, E]       int64, logcnt, number of replicas of each expert
-    """
+    """phy2log [L, S] -> (phy2log, log2phy [L, E, C] int32, logcnt [L, E])."""
     num_layers, num_slots = phy2log.shape
-    valid = phy2log >= 0                                      # [L, S]
-    logcnt = torch.zeros(num_layers, num_experts, dtype=torch.int64)    # [L, E]
+    valid = phy2log >= 0
+    logcnt = torch.zeros(num_layers, num_experts, dtype=torch.int64)
     logcnt.scatter_add_(-1, phy2log.clamp(min=0), valid.to(torch.int64))
-    maxcnt = max(int(logcnt.max()), 1)                        # C
+    maxcnt = max(int(logcnt.max()), 1)
     log2phy = torch.full((num_layers, num_experts, maxcnt), -1, dtype=torch.int32)
     for l in range(num_layers):
         cursor = [0] * num_experts
@@ -50,22 +39,14 @@ def log2phy_from_phy2log(phy2log: torch.Tensor, num_experts: int
 
 
 def rank_load(phy2log: torch.Tensor, weight: torch.Tensor, num_ranks: int = 8) -> torch.Tensor:
-    """Per-rank load; each replica of expert e carries weight[e]/logcnt[e].
-
-    Shapes (L layers, S slots, R ranks, E experts):
-        phy2log: [L, S]   int64, slot -> expert (-1 = empty)
-        weight:  [L, E]   float, token count per logical expert
-        return:  [L, R]   float, load carried by each rank
-    """
+    """phy2log [L, S], weight [L, E] -> load [L, R]; replica of e carries w[e]/logcnt[e]."""
     num_layers, num_slots = phy2log.shape
     slots = num_slots // num_ranks
-    w = weight.float()                                        # [L, E]
-    num_experts = w.shape[1]
-    valid = phy2log >= 0                                      # [L, S]
-    logcnt = torch.zeros(num_layers, num_experts)             # [L, E]
+    w = weight.float()
+    valid = phy2log >= 0
+    logcnt = torch.zeros(num_layers, w.shape[1])
     logcnt.scatter_add_(-1, phy2log.clamp(min=0), valid.float())
-    # per_replica[l, s] = load carried by slot s
-    per_replica = (w / logcnt.clamp(min=1)).gather(-1, phy2log.clamp(min=0)) * valid   # [L, S]
+    per_replica = (w / logcnt.clamp(min=1)).gather(-1, phy2log.clamp(min=0)) * valid
     return per_replica.view(num_layers, num_ranks, slots).sum(-1)
 
 
@@ -77,35 +58,31 @@ def _plan_layer(w: np.ndarray, num_ranks: int, epr: int, red: int) -> List[int]:
     lowers the global max rank load, so uniformly distributed traffic correctly
     gets no replicas (replication cannot help there) while skewed traffic does.
 
-    Shapes (E = num_ranks*epr experts, R = num_ranks, S = R*(epr+red) slots):
-        w:      [E]      float64, token count of each logical expert in this layer
-        return: [S]       list[int], slot -> logical expert id (-1 = empty slot)
+    w is [E]; returns [S] with slot -> expert.
     """
-    spr = epr + red                                   # slots per rank
-    num_experts = num_ranks * epr                     # E
-    cnt = np.ones(num_experts)                        # [E] replicas per expert
-    holds = np.zeros((num_ranks, num_experts), dtype=bool)   # [R, E] rank holds expert?
+    spr = epr + red
+    num_experts = num_ranks * epr
+    cnt = np.ones(num_experts)
+    holds = np.zeros((num_ranks, num_experts), dtype=bool)
     for r in range(num_ranks):
         holds[r, r * epr:(r + 1) * epr] = True
-    load = holds.astype(np.float64) @ w               # [R] current load per rank
-    free = np.full(num_ranks, red, dtype=np.int64)    # [R] redundant slots left per rank
+    load = holds.astype(np.float64) @ w               # [R]
+    free = np.full(num_ranks, red, dtype=np.int64)
 
     for _ in range(num_ranks * red):
-        cur_max = load.max()                                     # scalar
-        add = w / (cnt + 1.0)                                    # [E] added to target rank
-        rel = w / (cnt * (cnt + 1.0))                            # [E] relieved per holder
-        # after[e] = [R] rank loads once e gains a replica, before adding it anywhere
+        cur_max = load.max()
+        add = w / (cnt + 1.0)
+        rel = w / (cnt * (cnt + 1.0))
+        # after[e] is an independent hypothetical: rank loads if only e were replicated
         after = load[None, :] - rel[:, None] * holds.T           # [E, R]
-        after_max = after.max(axis=1)                            # [E]
-        # peak[e, r] = global max rank load if e's new replica lands on rank r
-        peak = np.maximum(after_max[:, None], after + add[:, None])   # [E, R]
-        peak[holds.T] = np.inf                                   # rank already has e
-        peak[:, free == 0] = np.inf                              # rank has no free slot
-        flat = int(np.argmin(peak))                              # scalar, index into [E, R]
-        e, r = divmod(flat, num_ranks)
+        # peak[e, r] = global max rank load if e's new replica lands on r
+        peak = np.maximum(after.max(axis=1)[:, None], after + add[:, None])
+        peak[holds.T] = np.inf
+        peak[:, free == 0] = np.inf
+        e, r = divmod(int(np.argmin(peak)), num_ranks)
         if not np.isfinite(peak[e, r]) or peak[e, r] >= cur_max - 1e-9:
             break
-        load = after[e].copy()                                   # [R]
+        load = after[e].copy()
         load[r] += add[e]
         holds[r, e] = True
         cnt[e] += 1
@@ -123,17 +100,9 @@ def _plan_layer(w: np.ndarray, num_ranks: int, epr: int, red: int) -> List[int]:
 
 def _diff_tasks(phy2log: torch.Tensor, prev: Optional[torch.Tensor], num_ranks: int,
                 epr: int, red: int) -> List[CopyTask]:
-    """Emit a copy task for every redundant slot whose content differs from `prev`.
-
-    Base slots are never scanned (they cannot change). The source is a constant:
-    expert e always has its base replica at rank e//epr, slot e%epr.
-
-    Shapes:
-        phy2log: [L, S] int64
-        prev:    [L, S] int64 or None (None = every occupied redundant slot is new)
-        return:  list of (layer, src_rank, src_slot, dst_rank, dst_slot, expert);
-                 dst_slot is rank-local (in [epr, epr+red)), not a global slot id
-    """
+    """Copy task per redundant slot differing from `prev`. Base slots are never
+    scanned; the source is a constant, e's base replica at rank e//epr slot e%epr.
+    dst_slot is rank-local, in [epr, epr+red)."""
     spr = epr + red
     tasks: List[CopyTask] = []
     for l in range(phy2log.shape[0]):
@@ -152,29 +121,17 @@ def plan_incremental_redundant(weight: torch.Tensor, num_ranks: int = 8,
                                experts_per_rank: int = 32, redundant_per_rank: int = 4,
                                prev_phy2log: Optional[torch.Tensor] = None
                                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[CopyTask]]:
-    """Pinned-Base incremental planner.
+    """Pinned-Base planner. Base slots are frozen (rank r keeps [r*epr, (r+1)*epr)),
+    so only the trailing redundant slots are planned and an expert gets at most
+    num_ranks replicas. Layers are independent.
 
-    Base slots are frozen: rank r keeps logical experts [r*epr, (r+1)*epr), so the
-    base mapping never changes and never needs a copy. Only the trailing
-    redundant_per_rank slots of each rank are used, giving at most num_ranks
-    replicas per expert (one per rank). Each layer is planned independently.
-
-    Shapes (L layers, E = num_ranks*experts_per_rank experts,
-            S = num_ranks*(experts_per_rank+redundant_per_rank) slots,
-            C = max replicas of any expert):
-        weight:       [L, E]  float, token count per logical expert
-        prev_phy2log: [L, S]  int64 or None, previous layout used to diff copy tasks
-        return:       [L, S]     int64, phy2log, slot -> expert (-1 = empty)
-                      [L, E, C]  int32, log2phy, replica k of expert e -> slot
-                      [L, E]     int64, logcnt, replicas per expert
-                      list       copy tasks (see _diff_tasks)
+    weight [L, E] -> phy2log [L, S], log2phy [L, E, C], logcnt [L, E], copy tasks.
     """
     weight = weight.float().cpu()
     num_layers, num_experts = weight.shape
     assert num_experts == num_ranks * experts_per_rank, (
         f"num_experts {num_experts} != num_ranks*experts_per_rank {num_ranks * experts_per_rank}")
     assert (weight >= 0).all(), "expert load must be non-negative"
-    spr = experts_per_rank + redundant_per_rank
 
     phy2log = static_phy2log(num_layers, num_ranks, experts_per_rank, redundant_per_rank)
     for l in range(num_layers):
