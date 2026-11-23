@@ -120,20 +120,67 @@ def test_replica_round_robin():
     sh.commit_routing(hot, BASE, replica=0)
     sh.commit_routing(hot, BASE + 1, replica=1, new_logcnt=2)
     for c, w in [(0, wa), (1, wb), (2, wa), (3, wb)]:
-        sh.set_cursor(c)
+        sh.set_cursor(c, expert=hot)
         y = sh.replay()
         torch.cuda.synchronize()
         assert torch.allclose(y[0].float(), ref(x[0], w).float(), atol=5e-2), f"cursor {c}"
 
 
-def test_cursor_is_gpu_resident():
-    """A Python int would be constant-folded; cursor must be a device tensor."""
+def test_batch_spreads_across_replicas():
+    """Within ONE step, tokens hitting the same expert must land on different
+    replicas. A global cursor would send them all to the same slot, so the
+    planner's w/c load model would hold only when averaged over steps."""
     sh, _, _ = make()
-    assert sh.cursor.is_cuda and sh.cursor.numel() == 1
+    x = torch.randn(8, H, device="cuda", dtype=torch.bfloat16)
+    e = torch.zeros(8, device="cuda", dtype=torch.int32)      # all on expert 0
+    for i in range(4):
+        sh.load_expert(BASE + i, rand_w())
+        sh.commit_routing(0, BASE + i, replica=i)
+    sh.logcnt[0] = 4
+
+    slots = sh._route(e).tolist()
+    assert sorted(slots) == [BASE, BASE, BASE + 1, BASE + 1,
+                             BASE + 2, BASE + 2, BASE + 3, BASE + 3], slots
+
+    sh.capture(x, e)
+    y = sh.replay()
+    torch.cuda.synchronize()
+    for t in range(8):
+        want = ref(x[t], sh.w_pool[slots[t]])
+        assert torch.allclose(y[t].float(), want.float(), atol=5e-2), f"token {t}"
+
+
+def test_cursor_carries_remainder_across_steps():
+    """An uneven split must not always favour the same replica."""
+    sh, _, _ = make()
+    e = torch.zeros(3, device="cuda", dtype=torch.int32)      # 3 tokens, 2 replicas
+    sh.commit_routing(0, BASE, replica=0)
+    sh.commit_routing(0, BASE + 1, replica=1, new_logcnt=2)
+
+    first = sh._route(e).tolist()
+    sh.advance_cursor(e)
+    second = sh._route(e).tolist()
+    assert first.count(BASE) == 2 and first.count(BASE + 1) == 1, first
+    assert second.count(BASE) == 1 and second.count(BASE + 1) == 2, second
+
+
+def test_cursor_is_per_expert():
+    sh, _, _ = make()
+    assert sh.cursor.is_cuda and sh.cursor.numel() == E
     before = sh.cursor.data_ptr()
-    sh.set_cursor(7)
-    assert int(sh.cursor) == 7
+    sh.set_cursor(7, expert=3)
+    assert int(sh.cursor[3]) == 7 and int(sh.cursor[0]) == 0
+    sh.set_cursor(0)
+    assert int(sh.cursor.sum()) == 0
     assert sh.cursor.data_ptr() == before, "set_cursor reallocated the tensor"
+
+
+def test_advance_cursor_counts_tokens():
+    sh, _, _ = make()
+    e = torch.tensor([0, 0, 0, 1], device="cuda", dtype=torch.int32)
+    sh.advance_cursor(e)
+    assert int(sh.cursor[0]) == 3 and int(sh.cursor[1]) == 1
+    assert int(sh.cursor[2]) == 0
 
 
 def test_async_stage_then_commit():

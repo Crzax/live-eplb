@@ -48,13 +48,13 @@ looks the weights up:
 ```python
 def _route(self, expert):
     e = expert.long()
-    cnt = self.logcnt.index_select(0, e).long()        # [T]
-    k = self.cursor.long() % cnt.clamp(min=1)          # [T] which replica
-    row = self.log2phy.index_select(0, e).long()       # [T, max_replicas]
-    return row.gather(1, k.unsqueeze(1)).squeeze(1)    # [T] slot ids
+    same = expert.unsqueeze(1) == expert.unsqueeze(0)
+    rank = same.tril(diagonal=-1).sum(1)               # [T] earlier tokens on same expert
+    cnt = self.logcnt[e].long()
+    k = (self.cursor[e] + rank) % cnt.clamp(min=1)     # [T] which replica
+    return self.log2phy[e].long().gather(1, k.unsqueeze(1)).squeeze(1)
 
-slot = self._route(expert)
-w = self.w_pool.index_select(0, slot)                  # gather, not pointer arithmetic
+w = self.w_pool[self._route(expert)]                   # gather, not pointer arithmetic
 ```
 
 Every address baked into the graph — `w_pool.data_ptr()`, `log2phy.data_ptr()`,
@@ -145,21 +145,43 @@ complexity away.
 ## Experiment 4: replica round-robin
 
 ```
-cursor=0 -> slot 32    matches hand-computed : True
-cursor=1 -> slot 33    matches hand-computed : True
+cursor[23]=0 -> slot 32    matches hand-computed : True
+cursor[23]=1 -> slot 33    matches hand-computed : True
+64 tokens all on expert 23 -> slots [32, 33], counts [32, 32]
+spread within one step (not just across steps): True
 ```
 
-Stage 1's planner assumes an expert with `c` replicas carries `w/c` per replica. That assumption is
-only true if the runtime actually spreads tokens across replicas. `cursor % logcnt[e]` is what makes
-it true, and this test confirms the graph honours it — each cursor value routes to a different slot
-and produces the output of a different weight tensor.
+Stage 1's planner assumes an expert with `c` replicas carries `w/c` per replica. If a second replica
+never receives tokens it relieves nothing, and every Stage 1 number would be wrong.
 
-If this did not hold, every Stage 1 number would be wrong, because a second replica that never
-receives tokens relieves nothing.
+**The first implementation got this wrong.** `cursor` was a single scalar shared by all experts, so
+within one step every token selected the same replica index — the whole batch piled onto one slot
+and the load only averaged out across steps. Since a MoE step is gated by the slowest rank, that
+averaging is worthless: each individual step stays skewed.
+
+Two things make the correct version work on a GPU. First, the obvious sequential formulation
+("read `cursor[e]`, use it, increment it") cannot be parallelised — all 64 tokens are routed
+simultaneously, so they would all observe the same value. Making it sequential would need atomics,
+whose ordering is non-deterministic and unreproducible inside a graph.
+
+So `rank` — how many earlier tokens in this batch hit the same expert — is **computed** instead of
+accumulated:
+
+```python
+same = expert.unsqueeze(1) == expert.unsqueeze(0)   # [T, T]
+rank = same.tril(diagonal=-1).sum(1)                # [T]
+```
+
+Second, `cursor` becomes per-expert and carries the remainder. With 3 tokens and 2 replicas the
+split is 2:1; advancing `cursor` by the token count makes the next step 1:2, so the leftover
+alternates rather than always favouring replica 0.
+
+`rank` spreads within a step, `cursor` spreads across steps. The measurement above shows 64 tokens
+on one expert splitting exactly 32/32.
 
 ## Tests
 
-`tests/test_moe_layer.py`, 11 tests.
+`tests/test_moe_layer.py`, 14 tests.
 
 | test | asserts |
 |---|---|
@@ -169,7 +191,10 @@ receives tokens relieves nothing.
 | `test_swap_actually_changes_output` | output differs before vs after (a no-op swap must fail) |
 | `test_addresses_pinned_across_swaps` | all four `data_ptr()` values survive filling every redundant slot |
 | `test_replica_round_robin` | cursor 0..3 alternates across two replicas correctly |
-| `test_cursor_is_gpu_resident` | cursor is a CUDA tensor and `set_cursor` does not reallocate it |
+| `test_batch_spreads_across_replicas` | 8 tokens on one expert with 4 replicas split 2/2/2/2 **within one step** |
+| `test_cursor_carries_remainder_across_steps` | a 3-token / 2-replica split flips from 2:1 to 1:2 after advancing |
+| `test_cursor_is_per_expert` | cursor has one entry per expert; `set_cursor` does not reallocate |
+| `test_advance_cursor_counts_tokens` | each expert's offset moves by exactly its token count |
 | `test_async_stage_then_commit` | staging on `transfer_stream`, polling, then committing yields the new weights |
 | `test_untouched_experts_unaffected` | swapping one expert leaves every other token's output bit-stable |
 | `test_reload_routing_keeps_address` | installing a whole new table keeps `log2phy.data_ptr()` |

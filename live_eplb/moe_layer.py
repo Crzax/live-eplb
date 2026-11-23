@@ -23,8 +23,8 @@ class GraphSafeMoEShard:
         self.w_pool = torch.zeros(slots, 3, moe_inter, hidden, device=device, dtype=dtype)
         self.log2phy = torch.full((experts, max_replicas), -1, dtype=torch.int32, device=device)
         self.logcnt = torch.zeros(experts, dtype=torch.int32, device=device)
-        # on-device: a Python int would be constant-folded into the graph
-        self.cursor = torch.zeros(1, dtype=torch.int32, device=device)
+        # per-expert round-robin offset; on-device or it would be folded into the graph
+        self.cursor = torch.zeros(experts, dtype=torch.int64, device=device)
 
         self._base_ptrs = (self.w_pool.data_ptr(), self.log2phy.data_ptr(),
                            self.logcnt.data_ptr(), self.cursor.data_ptr())
@@ -51,16 +51,28 @@ class GraphSafeMoEShard:
         self.w_pool[slot].copy_(w)
 
     def _route(self, expert: torch.Tensor) -> torch.Tensor:
-        """expert [T] -> slot [T]; round-robin so each replica carries w/logcnt."""
+        """expert [T] -> slot [T].
+
+        Replica k = (cursor[e] + rank) % logcnt[e], where rank counts how many
+        earlier tokens in this batch hit the same expert. rank spreads the batch
+        across replicas; cursor carries the leftover across steps. Computed rather
+        than accumulated, since every token is routed in parallel.
+        """
         e = expert.long()
-        cnt = self.logcnt.index_select(0, e).long()
-        k = self.cursor.long() % cnt.clamp(min=1)
-        row = self.log2phy.index_select(0, e).long()
-        return row.gather(1, k.unsqueeze(1)).squeeze(1)
+        same = expert.unsqueeze(1) == expert.unsqueeze(0)
+        rank = same.tril(diagonal=-1).sum(1)
+        cnt = self.logcnt[e].long()
+        k = (self.cursor[e] + rank) % cnt.clamp(min=1)
+        return self.log2phy[e].long().gather(1, k.unsqueeze(1)).squeeze(1)
+
+    def advance_cursor(self, expert: torch.Tensor) -> None:
+        """Move each expert's offset past the tokens it just served."""
+        e = expert.long()
+        self.cursor.index_add_(0, e, torch.ones_like(e))
 
     def forward(self, x: torch.Tensor, expert: torch.Tensor) -> torch.Tensor:
         """x [T, hidden], expert [T] -> [T, hidden]. SwiGLU, one expert per token."""
-        w = self.w_pool.index_select(0, self._route(expert))
+        w = self.w_pool[self._route(expert)]
         xv = x.unsqueeze(-1).to(w.dtype)
         gate = torch.bmm(w[:, GATE], xv).squeeze(-1)
         up = torch.bmm(w[:, UP], xv).squeeze(-1)
@@ -111,5 +123,8 @@ class GraphSafeMoEShard:
             self.logcnt[expert] = new_logcnt
         self.assert_addresses_pinned()
 
-    def set_cursor(self, value: int) -> None:
-        self.cursor.fill_(value)
+    def set_cursor(self, value: int, expert: Optional[int] = None) -> None:
+        if expert is None:
+            self.cursor.fill_(value)
+        else:
+            self.cursor[expert] = value

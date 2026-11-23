@@ -37,7 +37,7 @@ Key findings:
 
 ## Stage 2 — CUDA Graph in-place weight swap (single GPU) — DONE
 
-`live_eplb/moe_layer.py`, `tutorials/02_cudagraph_swap.py`, `tests/test_moe_layer.py` (11/11).
+`live_eplb/moe_layer.py`, `tutorials/02_cudagraph_swap.py`, `tests/test_moe_layer.py` (14/14).
 
 Results: see `docs/stage2_experiments.md`. Headline numbers — `commit_routing()` 0.033 ms vs full
 re-capture 25.164 ms (11.1x a decode step), zero re-captures across all four experiments, and a
@@ -56,6 +56,10 @@ Key findings:
   53 launches into a queue the GPU had barely begun.
 - `assert_addresses_pinned()` needs its own test. It is the only thing between a careless
   `self.log2phy = ...` and a graph reading freed memory.
+- Round-robin needs a per-expert cursor plus an in-batch rank. A single shared cursor sends the
+  whole batch to one replica, so the w/c model only holds when averaged over steps — useless when
+  each step is gated by its slowest rank. The sequential "read cursor, increment" form cannot be
+  parallelised, so rank is computed from the batch instead of accumulated.
 
 ### Original spec, kept for reference
 

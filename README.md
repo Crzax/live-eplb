@@ -86,7 +86,7 @@ the table — the graph never notices.
 | `tests/test_planner.py` | 14 invariant tests for the planner |
 | `live_eplb/moe_layer.py` | MoE shard with address-pinned `W_pool` / `log2phy`, graph capture, async staging |
 | `tutorials/02_cudagraph_swap.py` | In-place weight swap under a live graph, plus commit-vs-recapture timing |
-| `tests/test_moe_layer.py` | 11 tests for graph validity across swaps |
+| `tests/test_moe_layer.py` | 14 tests for graph validity across swaps |
 | `csrc/p2p_swapper.cu` | *(stage 3)* CUDA IPC handles, `cudaMemcpyPeerAsync`, routing-table commit |
 | `live_eplb/controller.py` | *(stage 4)* async state machine, IDLE -> COPYING -> COMMIT |
 
@@ -215,7 +215,7 @@ live-eplb/
 │   └── 02_cudagraph_swap.py    <- in-place swap under a live graph, timing
 ├── tests/
 │   ├── test_planner.py         <- 14 invariant tests
-│   └── test_moe_layer.py       <- 11 graph-validity tests
+│   └── test_moe_layer.py       <- 14 graph-validity tests
 ├── docs/
 │   ├── stage1_experiments.md   <- workload model, all measurements, limitations
 │   ├── stage1_debug_notes.md   <- four real bugs and what caught each one

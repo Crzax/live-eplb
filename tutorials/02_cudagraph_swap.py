@@ -196,13 +196,21 @@ def main():
 
     ok = True
     for c, w_expect, tag in [(0, new_w, f"slot {BASE}"), (1, other_w, f"slot {BASE+1}")]:
-        shard.set_cursor(c)
+        shard.set_cursor(c, expert=hot)
         yk = shard.replay()
         torch.cuda.synchronize()
         hit = torch.allclose(yk[0].float(), reference(x[0], w_expect).float(), atol=2e-2)
         ok &= hit
-        print(f"  cursor={c} -> {tag:<10} matches hand-computed : {hit}")
-    print(f"  round-robin works, so the planner's w/c load model holds at runtime: {ok}")
+        print(f"  cursor[{hot}]={c} -> {tag:<10} matches hand-computed : {hit}")
+
+    # within one step, tokens on the same expert must hit different replicas
+    shard.set_cursor(0)
+    same_e = torch.full((args.tokens,), hot, device="cuda", dtype=torch.int32)
+    spread = shard._route(same_e)
+    uniq, counts = spread.unique(return_counts=True)
+    print(f"  {args.tokens} tokens all on expert {hot} -> slots {uniq.tolist()}, "
+          f"counts {counts.tolist()}")
+    print(f"  spread within one step (not just across steps): {len(uniq) == 2}")
     print(f"  total re-captures across all four experiments: {shard.captures - 1}")
 
     # ------------------------------------------------------------------- 5. timing
