@@ -26,6 +26,11 @@ Measured cost of that re-capture, against one decode step on the same shard:
 Re-capturing costs eleven decode steps. Worse, it is synchronous and lands on whichever request is
 being served at that moment.
 
+> Re-capture time varies a lot between runs — a second run measured 57.3 ms (33.1x). It depends on
+> graph structure allocation and whether cuBLAS re-requests workspace, both of which hinge on
+> current memory fragmentation. **Trust the order of magnitude (10-30 decode steps), not the
+> figure.**
+
 > The two `replay()` rows are a reminder for anyone benchmarking this: without a `synchronize()` per
 > iteration you measure kernel launch (0.009 ms), not execution (2.265 ms). The first draft of this
 > script reported "53 overlapped replays in 0.5 ms", which was 53 enqueues into a queue the GPU had

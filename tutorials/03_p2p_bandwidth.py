@@ -154,8 +154,9 @@ def main():
         log(rank, f"      does compete for HBM, so a step slows while it runs.")
     else:
         log(rank, f"   pull finished before the first step completed")
-    log(rank, f"   staging {40*SLOT_MB:.0f} MB costs {sc_ms:.2f} ms of elevated step time,")
-    log(rank, f"   against {57:.0f} ms for a stop-the-world re-capture (stage 2)")
+    if during:
+        extra = sum(during) - solo * len(during)
+        log(rank, f"   total extra latency for the whole migration: {extra:.2f} ms")
 
     sw.close()
     dist.barrier()

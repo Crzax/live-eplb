@@ -104,9 +104,10 @@ Results: see `docs/stage3_experiments.md`. 8/8 ranks bit-identical pulls, commit
 
 Key findings:
 - **"Copy engine does not use SMs, therefore no interference" is wrong.** A 252 MB peer pull slows
-  a concurrent GEMM by 2.15x; a 3 GB pull by 28x. The copy engine does not take SMs but it does
-  write into local HBM, which the GEMM is reading. Still a 30x improvement over a 57 ms
-  stop-the-world re-capture, and the slowdown is gradual rather than a stall.
+  a concurrent GEMM by 2.4x; a 3 GB pull by 28x. The copy engine does not take SMs but it does
+  write into local HBM, which the GEMM is reading. Still an order of magnitude better than a
+  stop-the-world re-capture (25-57 ms measured in Stage 2), and the slowdown is gradual rather
+  than a stall.
 - Bandwidth is launch-bound for small copies: one 6.29 MB slot gets 147 GB/s against a 376 GB/s
   single-pair ceiling. Coalescing consecutive slots into one call reaches 272 GB/s. Scattered
   40-slot batches cannot coalesce, so they sit at 167 GB/s — and that is the realistic case.

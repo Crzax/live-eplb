@@ -179,8 +179,9 @@ torchrun --nproc_per_node=4 tests/test_p2p.py
 3. commit_routing_table (single launch, no atomics)
    commit latency         : 12.6 us
 4. interference with compute
-   step alone                  : 0.286 ms
-   step during 252 MB pull     : 0.615 ms  (2.15x)
+   step alone                  : 0.280 ms
+   step during 252 MB pull     : 0.667 ms  (2.38x)
+   total extra latency         : 0.39 ms
 ```
 
 ## The trade-off
@@ -266,7 +267,7 @@ live-eplb/
 | [`docs/stage2_experiments.md`](docs/stage2_experiments.md) | Why a graph freezes pointers, the two-level indirection, the Python-int trap, commit vs re-capture timing |
 | [`docs/stage2_debug_notes.md`](docs/stage2_debug_notes.md) | Two more bugs: async timing measured as sync, and a shared cursor that made replication a no-op within a step |
 | [`docs/stage3_experiments.md`](docs/stage3_experiments.md) | CUDA IPC vs NCCL send/recv, why coalescing doubles bandwidth, how much a peer copy actually costs a decode step |
-| [`docs/stage3_debug_notes.md`](docs/stage3_debug_notes.md) | A parameter whose meaning drifted, and a hardware assumption ("copy engine does not touch SMs, therefore no interference") that measured 2.15x wrong |
+| [`docs/stage3_debug_notes.md`](docs/stage3_debug_notes.md) | A parameter whose meaning drifted, and a hardware assumption ("copy engine does not touch SMs, therefore no interference") that measured 2.4x wrong |
 | [`ROADMAP.md`](ROADMAP.md) | Technical spec for each stage, plus the pitfalls worth knowing before writing the code |
 
 ## Prior art

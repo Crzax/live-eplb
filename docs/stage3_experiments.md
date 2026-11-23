@@ -64,11 +64,12 @@ commit latency         : 12.6 us
 ## 实验 4：拷贝对计算的干扰 —— 预期之外的结果
 
 ```
-step alone                  : 0.286 ms
-step during 252 MB pull     : 0.615 ms  (2.15x)
+step alone                  : 0.280 ms
+step during 252 MB pull     : 0.667 ms  (2.38x)
+total extra latency for the whole migration: 0.39 ms
 ```
 
-**这个结果和我的预期相反。** 我原本以为 `cudaMemcpyPeerAsync` 走 copy engine、不占 SM，所以对计算零干扰。实测慢了 2.15 倍。
+**这个结果和我的预期相反。** 我原本以为 `cudaMemcpyPeerAsync` 走 copy engine、不占 SM，所以对计算零干扰。实测慢了 2.1-2.4 倍（多次运行波动）。
 
 单独验证了一下更极端的情况（3 GB 拷贝 + GEMM）：慢 **28 倍**。
 
@@ -85,16 +86,25 @@ H20 的 HBM 带宽约 4 TB/s，NVLink 单向 376 GB/s 只占 9%，看起来不�
 | | 错误表述 | 实测 |
 |---|---|---|
 | 阻塞 | "拷贝完全不影响推理" | 不阻塞 stream，但 step 会变慢 2.15× |
-| 代价 | "免费" | 252 MB 的迁移 ≈ 1.5 ms 的降速窗口 |
+| 代价 | "免费" | 252 MB 迁移 = 1.5 ms 降速窗口，实测多付 0.39 ms |
 
 和 stop-the-world 对比才是重点：
 
 ```
-Stop-the-world:  57 ms 完全停住（Stage 2 实测重录耗时）
-LiveEPLB:        1.5 ms 窗口内 step 变慢 2.15×，之后恢复
+Stop-the-world:  一次重录完全停住（Stage 2 单卡实测 25-57 ms，取决于显存碎片）
+LiveEPLB:        1.5 ms 窗口内 step 变慢 2.38×，整次迁移实测多付 0.39 ms
 ```
 
-1.5 ms × 2.15 倍降速 ≈ 多花 1.8 ms，对比 57 ms 的完全停顿，仍然是 **30 倍以上的改善**。而且降速是渐进的，不是断崖式卡住。
+> 重录耗时波动很大：Stage 2 两次运行分别是 25.2 ms 和 57.3 ms。它受 graph 内部结构分配和
+> cuBLAS workspace 申请影响，而这些取决于当时的显存碎片状况。所以**可信的是量级（一个
+> decode step 的 10-30 倍），不是具体数值**。两个实验环境也不同（Stage 2 单进程单卡，
+> Stage 3 八进程），严格来说不该直接相减。
+
+即便取最乐观的 25 ms，0.39 ms 的额外延迟也是**两个数量级**的改善，而且降速是渐进的，不是断崖式卡住。
+
+> 这个 0.39 ms 偏乐观：拷贝窗口（1.5 ms）里只放得下 1 个 step（0.28 ms 正常 / 0.67 ms 受扰），
+> 所以受影响的 step 很少。真实 decode step 要长得多（Stage 2 单层实测 1.7-2.3 ms），
+> 拷贝可能在一个 step 内就完成，额外延迟会更接近"一个 step 慢 2 倍"。Stage 4 用真实步长测。
 
 Stage 4 可以进一步优化：把 40 层的迁移**分摊到多个 step**，每拍只搬一两层，把降速幅度压到可忽略。这是"有界迁移量"带来的额外自由度——反正最多 32 槽，怎么分摊都可控。
 
