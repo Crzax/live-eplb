@@ -219,7 +219,8 @@ live-eplb/
 ├── docs/
 │   ├── stage1_experiments.md   <- workload model, all measurements, limitations
 │   ├── stage1_debug_notes.md   <- four real bugs and what caught each one
-│   └── stage2_experiments.md   <- indirection design, the Python-int trap, timing
+│   ├── stage2_experiments.md   <- indirection design, the Python-int trap, timing
+│   └── stage2_debug_notes.md   <- async timing trap, shared-cursor design bug
 └── ROADMAP.md                  <- per-stage specs and known pitfalls
 ```
 
@@ -230,6 +231,7 @@ live-eplb/
 | [`docs/stage1_experiments.md`](docs/stage1_experiments.md) | Zipf workload model, main comparison, two ablations, correctness checks, known limitations |
 | [`docs/stage1_debug_notes.md`](docs/stage1_debug_notes.md) | Four bugs found during Stage 1, including two that passed every structural test while silently producing wrong plans |
 | [`docs/stage2_experiments.md`](docs/stage2_experiments.md) | Why a graph freezes pointers, the two-level indirection, the Python-int trap, commit vs re-capture timing |
+| [`docs/stage2_debug_notes.md`](docs/stage2_debug_notes.md) | Two more bugs: async timing measured as sync, and a shared cursor that made replication a no-op within a step |
 | [`ROADMAP.md`](ROADMAP.md) | Technical spec for each stage, plus the pitfalls worth knowing before writing the code |
 
 ## Prior art
