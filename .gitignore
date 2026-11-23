@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# generated artifacts
+results/
+*.pt
+*.pth
+
+# local notes (machine-specific paths / credentials)
+测试方式
+TODO
+
+.vscode/
+.idea/
+.DS_Store
+
+# upstream DeepSeek EPLB clone (separate git repo); the baseline is vendored
+# into live_eplb/eplb_official.py instead
+EPLB/
