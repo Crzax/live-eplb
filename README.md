@@ -87,7 +87,10 @@ the table — the graph never notices.
 | `live_eplb/moe_layer.py` | MoE shard with address-pinned `W_pool` / `log2phy`, graph capture, async staging |
 | `tutorials/02_cudagraph_swap.py` | In-place weight swap under a live graph, plus commit-vs-recapture timing |
 | `tests/test_moe_layer.py` | 14 tests for graph validity across swaps |
-| `csrc/p2p_swapper.cu` | *(stage 3)* CUDA IPC handles, `cudaMemcpyPeerAsync`, routing-table commit |
+| `csrc/p2p_swapper.cu` | CUDA IPC handles, `cudaMemcpyPeerAsync`, single-launch routing commit |
+| `live_eplb/p2p.py` | Handle exchange, coalesced peer pulls, task filtering per rank |
+| `tutorials/03_p2p_bandwidth.py` | Cross-process correctness, NVLink bandwidth, HBM interference |
+| `tests/test_p2p.py` | 10 multi-process tests |
 | `live_eplb/controller.py` | *(stage 4)* async state machine, IDLE -> COPYING -> COMMIT |
 
 ## Installation
@@ -158,6 +161,28 @@ python tests/test_moe_layer.py
   full re-capture         25.164 ms   (11.1x a step)
 ```
 
+Stage 3 needs the CUDA extension and multiple processes:
+
+```bash
+pip install -e . --no-build-isolation
+torchrun --nproc_per_node=8 tutorials/03_p2p_bandwidth.py
+torchrun --nproc_per_node=4 tests/test_p2p.py
+```
+
+```
+1. correctness
+   ranks with bit-identical pull: 8/8
+2. bandwidth (NV18 all-to-all, 18 links/pair)
+   1 slot            6.29 MB    0.043 ms    147.6 GB/s
+   4 contiguous     25.17 MB    0.092 ms    272.3 GB/s
+   40 scattered     251.7 MB    1.507 ms    167.0 GB/s
+3. commit_routing_table (single launch, no atomics)
+   commit latency         : 12.6 us
+4. interference with compute
+   step alone                  : 0.286 ms
+   step during 252 MB pull     : 0.615 ms  (2.15x)
+```
+
 ## The trade-off
 
 The planner is not strictly better than the official one — it occupies a different point:
@@ -192,7 +217,7 @@ latency budget.
 |---|---|---|
 | 1 | Bounded incremental planner vs official EPLB | **done** |
 | 2 | Single-GPU CUDA Graph in-place swap, zero re-capture | **done** |
-| 3 | CUDA IPC + `cudaMemcpyPeerAsync` NVLink P2P engine | todo |
+| 3 | CUDA IPC + `cudaMemcpyPeerAsync` NVLink P2P engine | **done** |
 | 4 | Async state machine + 8x H20 TPOT benchmark | todo |
 | 5 | Real router traces from Qwen3.6-35B-A3B | todo |
 
@@ -204,23 +229,31 @@ Target model: `Qwen/Qwen3.6-35B-A3B` — 40 MoE layers, 256 routed experts, top-
 
 ```
 live-eplb/
+├── csrc/
+│   └── p2p_swapper.cu          <- CUDA IPC, peer copy, routing commit kernel
 ├── live_eplb/
 │   ├── planner.py              <- Pinned-Base planner, peak-driven greedy
 │   ├── moe_layer.py            <- address-pinned MoE shard, graph capture, hot swap
+│   ├── p2p.py                  <- cross-process pulls over NVLink
 │   ├── eplb_official.py        <- vendored DeepSeek EPLB (MIT), baseline only
 │   └── EPLB_LICENSE
 ├── tutorials/
 │   ├── 01_eplb_diff.py         <- main comparison, writes results/stage1_plans.pt
 │   ├── 01b_ablation.py         <- alpha sweep + equal-budget ablation
-│   └── 02_cudagraph_swap.py    <- in-place swap under a live graph, timing
+│   ├── 02_cudagraph_swap.py    <- in-place swap under a live graph, timing
+│   └── 03_p2p_bandwidth.py     <- peer copy correctness, bandwidth, interference
 ├── tests/
 │   ├── test_planner.py         <- 14 invariant tests
-│   └── test_moe_layer.py       <- 14 graph-validity tests
+│   ├── test_moe_layer.py       <- 14 graph-validity tests
+│   └── test_p2p.py             <- 10 multi-process tests
 ├── docs/
 │   ├── stage1_experiments.md   <- workload model, all measurements, limitations
 │   ├── stage1_debug_notes.md   <- four real bugs and what caught each one
 │   ├── stage2_experiments.md   <- indirection design, the Python-int trap, timing
-│   └── stage2_debug_notes.md   <- async timing trap, shared-cursor design bug
+│   ├── stage2_debug_notes.md   <- async timing trap, shared-cursor design bug
+│   ├── stage3_experiments.md   <- IPC, bandwidth vs coalescing, HBM contention
+│   └── stage3_debug_notes.md   <- parameter-semantics drift, a wrong hardware assumption
+├── setup.py
 └── ROADMAP.md                  <- per-stage specs and known pitfalls
 ```
 
@@ -232,6 +265,8 @@ live-eplb/
 | [`docs/stage1_debug_notes.md`](docs/stage1_debug_notes.md) | Four bugs found during Stage 1, including two that passed every structural test while silently producing wrong plans |
 | [`docs/stage2_experiments.md`](docs/stage2_experiments.md) | Why a graph freezes pointers, the two-level indirection, the Python-int trap, commit vs re-capture timing |
 | [`docs/stage2_debug_notes.md`](docs/stage2_debug_notes.md) | Two more bugs: async timing measured as sync, and a shared cursor that made replication a no-op within a step |
+| [`docs/stage3_experiments.md`](docs/stage3_experiments.md) | CUDA IPC vs NCCL send/recv, why coalescing doubles bandwidth, how much a peer copy actually costs a decode step |
+| [`docs/stage3_debug_notes.md`](docs/stage3_debug_notes.md) | A parameter whose meaning drifted, and a hardware assumption ("copy engine does not touch SMs, therefore no interference") that measured 2.15x wrong |
 | [`ROADMAP.md`](ROADMAP.md) | Technical spec for each stage, plus the pitfalls worth knowing before writing the code |
 
 ## Prior art

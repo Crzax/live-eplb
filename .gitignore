@@ -21,3 +21,5 @@ TODO
 # upstream DeepSeek EPLB clone (separate git repo); the baseline is vendored
 # into live_eplb/eplb_official.py instead
 EPLB/
+*.egg-info/
+_probe_*.py

@@ -94,9 +94,28 @@ Pitfalls to avoid:
 Acceptance: output matches the hand-computed expectation; print replay count and re-capture count,
 the latter must be 0.
 
-## Stage 3 — NVLink P2P engine
+## Stage 3 — NVLink P2P engine — DONE
 
-`csrc/p2p_swapper.cu`, `setup.py`
+`csrc/p2p_swapper.cu`, `setup.py`, `live_eplb/p2p.py`, `tutorials/03_p2p_bandwidth.py`,
+`tests/test_p2p.py` (10/10 under torchrun).
+
+Results: see `docs/stage3_experiments.md`. 8/8 ranks bit-identical pulls, commit latency 12.6 us,
+40 scattered slots (252 MB) in 1.5 ms.
+
+Key findings:
+- **"Copy engine does not use SMs, therefore no interference" is wrong.** A 252 MB peer pull slows
+  a concurrent GEMM by 2.15x; a 3 GB pull by 28x. The copy engine does not take SMs but it does
+  write into local HBM, which the GEMM is reading. Still a 30x improvement over a 57 ms
+  stop-the-world re-capture, and the slowdown is gradual rather than a stall.
+- Bandwidth is launch-bound for small copies: one 6.29 MB slot gets 147 GB/s against a 376 GB/s
+  single-pair ceiling. Coalescing consecutive slots into one call reaches 272 GB/s. Scattered
+  40-slot batches cannot coalesce, so they sit at 167 GB/s — and that is the realistic case.
+- IPC + peer copy is **one-sided**: only the destination rank acts. NCCL send/recv needs both ends
+  to call in, which would couple every rank's migration timing in Stage 4.
+- New design freedom from the interference finding: spread the 40-layer migration across several
+  decode steps to flatten the bandwidth spike. Only possible because the volume is bounded.
+
+### Original spec, kept for reference
 
 PyBind11 extension `live_eplb_cuda`:
 - `get_ipc_handle(pool)` — `cudaIpcGetMemHandle`, exports the allocation base handle.
@@ -131,6 +150,8 @@ cross-check against `nvidia-smi topo -m`.
 - The planner is deterministic, so every rank computes an identical plan independently —
   **no need to broadcast the placement**. Only the EMA statistics need an all-reduce (or all-gather,
   which moves less data).
+ - Stage 3 measured that a bulk pull slows a concurrent step by ~2x, so consider pacing: migrate a
+   couple of layers per step rather than all 40 at once. Bounded volume makes that schedulable.
 
 300 decode steps, hot-expert shift injected at step 80, three policies, output
 `results/synthetic_tpot_timeline.png`:
