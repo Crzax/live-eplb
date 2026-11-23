@@ -97,7 +97,7 @@ the latter must be 0.
 ## Stage 3 — NVLink P2P engine — DONE
 
 `csrc/p2p_swapper.cu`, `setup.py`, `live_eplb/p2p.py`, `tutorials/03_p2p_bandwidth.py`,
-`tests/test_p2p.py` (10/10 under torchrun).
+`tests/test_p2p.py` (11/11 under torchrun).
 
 Results: see `docs/stage3_experiments.md`. 8/8 ranks bit-identical pulls, commit latency 12.6 us,
 40 scattered slots (252 MB) in 1.5 ms.

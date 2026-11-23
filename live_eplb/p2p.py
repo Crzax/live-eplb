@@ -76,19 +76,19 @@ class P2PSwapper:
             ev.record(s)
         return ev
 
-    def local_tasks(self, copy_tasks: Sequence[CopyTask], layer: int,
-                    slots_per_rank: int) -> List[Tuple[int, int, int]]:
-        """Filter planner output down to the copies this rank must perform.
+    def local_tasks(self, copy_tasks: Sequence[CopyTask],
+                    layer: int) -> List[Tuple[int, int, int]]:
+        """Pick out the pulls this rank owns from the global task list.
 
-        Planner tasks carry a global layer index and rank-local slot numbers; a
-        rank only pulls into its own redundant slots.
+        The planner never emits src_rank == dst_rank: a rank holding e in a base
+        slot is excluded as a replica target, so every task is a real peer copy.
         """
         out = []
         for l, src_rank, src_slot, dst_rank, dst_slot, _ in copy_tasks:
             if l != layer or dst_rank != self.rank:
                 continue
+            assert src_rank != dst_rank, f"self-copy in task {(l, src_rank, dst_rank)}"
             out.append((dst_slot, src_rank, src_slot))
-        _ = slots_per_rank
         return out
 
     def commit(self, log2phy: torch.Tensor, new_log2phy: torch.Tensor,

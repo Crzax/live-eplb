@@ -100,7 +100,7 @@ Stage 4 可以进一步优化：把 40 层的迁移**分摊到多个 step**，�
 
 ## 测试
 
-`tests/test_p2p.py`，10 个，需要 `torchrun --nproc_per_node>=2`。
+`tests/test_p2p.py`，11 个，需要 `torchrun --nproc_per_node>=2`。
 
 | 测试 | 断言 |
 |---|---|
@@ -113,7 +113,13 @@ Stage 4 可以进一步优化：把 40 层的迁移**分摊到多个 step**，�
 | `test_commit_applies_table` | 表被覆盖且地址不变 |
 | `test_commit_rejects_bad_dtype` | int64 表被拒绝 |
 | `test_local_tasks_filters_by_rank` | 规划器输出能正确过滤出本 rank 的任务 |
+| `test_local_tasks_rejects_self_copy` | `src_rank == dst_rank` 会被断言拦下 |
 | `test_oob_slot_rejected` | 越界槽位被拒绝 |
+
+`test_local_tasks_rejects_self_copy` 测的是一个**规划器层面已经保证的不变量**：专家 e 的本体固定在
+卡 `e // epr` 的 base 槽里，而贪心会排除已持有 e 的卡（`peak[holds.T] = inf`），所以
+`src_rank == dst_rank` 的任务根本不可能产生。断言是为了防止将来改规划器时破坏这个性质——
+真发生了就是自己拷自己，白占一个冗余槽且毫无收益。
 
 `test_pull_leaves_other_slots_alone` 是针对地址计算错误的——如果 `dst_off` 算错，很可能覆盖到 base 槽，而 base 槽是 Stage 1 承诺"全程只读"的。
 

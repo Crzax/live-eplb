@@ -96,10 +96,20 @@ def test_commit_rejects_bad_dtype(sw, pool, rank, world):
 
 
 def test_local_tasks_filters_by_rank(sw, pool, rank, world):
-    tasks = [(0, 0, 1, 0, 8, 1), (0, 1, 2, 1, 8, 34), (1, 0, 3, 0, 9, 3)]
-    mine = sw.local_tasks(tasks, layer=0, slots_per_rank=SLOTS)
-    expect = [(8, 0, 1)] if rank == 0 else ([(8, 1, 2)] if rank == 1 else [])
+    tasks = [(0, 1, 1, 0, 8, 33), (0, 0, 2, 1, 8, 2), (1, 1, 3, 0, 9, 35)]
+    mine = sw.local_tasks(tasks, layer=0)
+    expect = [(8, 1, 1)] if rank == 0 else ([(8, 0, 2)] if rank == 1 else [])
     assert mine == expect, (rank, mine)
+
+
+def test_local_tasks_rejects_self_copy(sw, pool, rank, world):
+    """The planner cannot emit src_rank == dst_rank; assert we would notice."""
+    bad = [(0, rank, 1, rank, 8, 1)]
+    try:
+        sw.local_tasks(bad, layer=0)
+    except AssertionError:
+        return
+    raise AssertionError("self-copy went undetected")
 
 
 def test_oob_slot_rejected(sw, pool, rank, world):

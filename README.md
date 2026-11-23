@@ -90,7 +90,7 @@ the table — the graph never notices.
 | `csrc/p2p_swapper.cu` | CUDA IPC handles, `cudaMemcpyPeerAsync`, single-launch routing commit |
 | `live_eplb/p2p.py` | Handle exchange, coalesced peer pulls, task filtering per rank |
 | `tutorials/03_p2p_bandwidth.py` | Cross-process correctness, NVLink bandwidth, HBM interference |
-| `tests/test_p2p.py` | 10 multi-process tests |
+| `tests/test_p2p.py` | 11 multi-process tests |
 | `live_eplb/controller.py` | *(stage 4)* async state machine, IDLE -> COPYING -> COMMIT |
 
 ## Installation
@@ -245,7 +245,7 @@ live-eplb/
 ├── tests/
 │   ├── test_planner.py         <- 14 invariant tests
 │   ├── test_moe_layer.py       <- 14 graph-validity tests
-│   └── test_p2p.py             <- 10 multi-process tests
+│   └── test_p2p.py             <- 11 multi-process tests
 ├── docs/
 │   ├── stage1_experiments.md   <- workload model, all measurements, limitations
 │   ├── stage1_debug_notes.md   <- four real bugs and what caught each one
