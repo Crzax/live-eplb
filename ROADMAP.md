@@ -35,9 +35,29 @@ Key findings:
   reaches 1.166 while the peak-driven greedy reaches 1.108. The remaining gap to the
   unconstrained 1.000 is the price of the constraint, not a weaker algorithm.
 
-## Stage 2 — CUDA Graph in-place weight swap (single GPU)
+## Stage 2 — CUDA Graph in-place weight swap (single GPU) — DONE
 
-`tutorials/02_cudagraph_swap.py`
+`live_eplb/moe_layer.py`, `tutorials/02_cudagraph_swap.py`, `tests/test_moe_layer.py` (11/11).
+
+Results: see `docs/stage2_experiments.md`. Headline numbers — `commit_routing()` 0.033 ms vs full
+re-capture 25.164 ms (11.1x a decode step), zero re-captures across all four experiments, and a
+252 MB staging batch overlapped a complete decode step that still took its normal 3.97 ms.
+
+Key findings:
+- A Python int index really is constant-folded at capture: setting `py_slot = 5` after capture
+  leaves the output equal to slot 0 forever, with no error. A GPU-resident index is re-read on
+  every replay. Verified both directions before writing the implementation.
+- Overlapping the copy with inference is only safe because of the Pinned-Base invariant: an unused
+  redundant slot holds -1, so no routing entry points at it and no token can reach it. xLLM needs
+  staging buffers and a two-phase prepare/activate protocol precisely because it cannot assume
+  the target slot is dead.
+- Benchmark trap: `graph.replay()` without a per-iteration `synchronize()` measures enqueue
+  (0.009 ms), not execution (2.265 ms). The first draft reported "53 replays in 0.5 ms", which was
+  53 launches into a queue the GPU had barely begun.
+- `assert_addresses_pinned()` needs its own test. It is the only thing between a careless
+  `self.log2phy = ...` and a graph reading freed memory.
+
+### Original spec, kept for reference
 
 The core conflict: a CUDA Graph freezes every kernel argument — including weight pointers — at
 capture time. If swapping an expert means pointing at different memory, the graph must be

@@ -83,8 +83,10 @@ the table — the graph never notices.
 | `live_eplb/eplb_official.py` | DeepSeek EPLB, vendored verbatim, used only as the comparison baseline |
 | `tutorials/01_eplb_diff.py` | Official full reshuffle vs bounded incremental planning |
 | `tutorials/01b_ablation.py` | Skew sweep, and the same-budget constraint-vs-algorithm ablation |
-| `tests/test_planner.py` | 14 invariant tests |
-| `live_eplb/moe_layer.py` | *(stage 2)* EP=8 MoE layer with address-pinned `W_pool` / `log2phy` |
+| `tests/test_planner.py` | 14 invariant tests for the planner |
+| `live_eplb/moe_layer.py` | MoE shard with address-pinned `W_pool` / `log2phy`, graph capture, async staging |
+| `tutorials/02_cudagraph_swap.py` | In-place weight swap under a live graph, plus commit-vs-recapture timing |
+| `tests/test_moe_layer.py` | 11 tests for graph validity across swaps |
 | `csrc/p2p_swapper.cu` | *(stage 3)* CUDA IPC handles, `cudaMemcpyPeerAsync`, routing-table commit |
 | `live_eplb/controller.py` | *(stage 4)* async state machine, IDLE -> COPYING -> COMMIT |
 
@@ -133,6 +135,29 @@ python tutorials/01b_ablation.py
 python tests/test_planner.py
 ```
 
+Stage 2 needs one GPU. It swaps an expert under a live CUDA Graph and checks the result against a
+reference computed outside the graph:
+
+```bash
+python tutorials/02_cudagraph_swap.py
+python tests/test_moe_layer.py
+```
+
+```
+3. swap an expert into a redundant slot, zero re-capture
+  40-layer batch (252 MB): overlapped 1 full decode steps, step time 3.97-3.97 ms
+  expert 23: slot 23 -> slot 32
+    token0 == new weights (hand-computed): True
+    token0 != old weights                : True
+    W_pool address unchanged             : 0x7f1668000000
+    captures: 1 -> 1  (re-captures = 0)
+
+5. in-place commit vs full re-capture
+  graph.replay() GPU       2.265 ms   (one decode step, synced)
+  commit_routing()         0.033 ms   (1.5% of a step)
+  full re-capture         25.164 ms   (11.1x a step)
+```
+
 ## The trade-off
 
 The planner is not strictly better than the official one — it occupies a different point:
@@ -166,7 +191,7 @@ latency budget.
 | Stage | Scope | State |
 |---|---|---|
 | 1 | Bounded incremental planner vs official EPLB | **done** |
-| 2 | Single-GPU CUDA Graph in-place swap, zero re-capture | in progress |
+| 2 | Single-GPU CUDA Graph in-place swap, zero re-capture | **done** |
 | 3 | CUDA IPC + `cudaMemcpyPeerAsync` NVLink P2P engine | todo |
 | 4 | Async state machine + 8x H20 TPOT benchmark | todo |
 | 5 | Real router traces from Qwen3.6-35B-A3B | todo |
@@ -181,16 +206,20 @@ Target model: `Qwen/Qwen3.6-35B-A3B` — 40 MoE layers, 256 routed experts, top-
 live-eplb/
 ├── live_eplb/
 │   ├── planner.py              <- Pinned-Base planner, peak-driven greedy
+│   ├── moe_layer.py            <- address-pinned MoE shard, graph capture, hot swap
 │   ├── eplb_official.py        <- vendored DeepSeek EPLB (MIT), baseline only
 │   └── EPLB_LICENSE
 ├── tutorials/
 │   ├── 01_eplb_diff.py         <- main comparison, writes results/stage1_plans.pt
-│   └── 01b_ablation.py         <- alpha sweep + equal-budget ablation
+│   ├── 01b_ablation.py         <- alpha sweep + equal-budget ablation
+│   └── 02_cudagraph_swap.py    <- in-place swap under a live graph, timing
 ├── tests/
-│   └── test_planner.py         <- 14 invariant tests
+│   ├── test_planner.py         <- 14 invariant tests
+│   └── test_moe_layer.py       <- 11 graph-validity tests
 ├── docs/
 │   ├── stage1_experiments.md   <- workload model, all measurements, limitations
-│   └── stage1_debug_notes.md   <- four real bugs and what caught each one
+│   ├── stage1_debug_notes.md   <- four real bugs and what caught each one
+│   └── stage2_experiments.md   <- indirection design, the Python-int trap, timing
 └── ROADMAP.md                  <- per-stage specs and known pitfalls
 ```
 
@@ -200,6 +229,7 @@ live-eplb/
 |---|---|
 | [`docs/stage1_experiments.md`](docs/stage1_experiments.md) | Zipf workload model, main comparison, two ablations, correctness checks, known limitations |
 | [`docs/stage1_debug_notes.md`](docs/stage1_debug_notes.md) | Four bugs found during Stage 1, including two that passed every structural test while silently producing wrong plans |
+| [`docs/stage2_experiments.md`](docs/stage2_experiments.md) | Why a graph freezes pointers, the two-level indirection, the Python-int trap, commit vs re-capture timing |
 | [`ROADMAP.md`](ROADMAP.md) | Technical spec for each stage, plus the pitfalls worth knowing before writing the code |
 
 ## Prior art
