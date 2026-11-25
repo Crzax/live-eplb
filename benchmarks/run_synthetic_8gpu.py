@@ -5,8 +5,10 @@ torchrun --nproc_per_node=8 benchmarks/run_synthetic_8gpu.py
   static       - no balancing at all
   stw          - our planner, copy synchronously, re-capture the graph
   stw_inplace  - our planner, copy synchronously, commit the table in place
-  stw_official - DeepSeek's official EPLB planner + full reshuffle (staging a
-                 pool-sized buffer to break copy cycles) + re-capture
+  stw_official - DeepSeek's official EPLB planner + staged full reshuffle
+                 (barriers + a pool-sized buffer to break copy cycles) + re-capture
+  stw_official_inplace
+               - same planner and staged copy, but in-place commit, no re-capture
   live         - our planner, stage in background, commit the table in place
 """
 import argparse, json, os, sys, time
@@ -136,9 +138,11 @@ def run(policy, args, rank, world, stack, sw):
                                   check_every=args.check_every)
 
     base_phy2log = static_phy2log(L, RANKS, EPR, RED)
-    off_p2l = base_phy2log.clone()      # placement in force for stw_official
-    staging = (torch.empty_like(stack.w_pool) if policy == "stw_official"
-               else None)
+    official = policy.startswith("stw_official")
+    off_p2l = base_phy2log.clone()      # placement in force for the official variants
+    staging = torch.empty_like(stack.w_pool) if official else None
+    if os.environ.get("ALLOC_BUF"):     # A/B probe for "extra pool allocation slows the replay"
+        _buf = torch.empty_like(stack.w_pool)
     ema = torch.zeros(L, EXPERTS)
     tpot, actions, imbalance, ctrl_ms, split = [], [], [], [], []
     stw_last, stw_commits = -args.cooldown, 0
@@ -158,6 +162,13 @@ def run(policy, args, rank, world, stack, sw):
     pin = torch.empty(L, EXPERTS).pin_memory()
     dev_counts = torch.empty(L, EXPERTS, device="cuda")
     x = torch.randn(args.tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    if args.init_official:
+        # layout-level A/B: install the official placement BEFORE the first
+        # capture, no commits afterwards -- isolates "layout itself" from any
+        # re-capture or staging effects
+        phy0, l2p0, _ = rebalance_experts(torch.ones(L, EXPERTS), RANKS * SLOTS, 1, 1, RANKS)
+        l0, cn0 = rank_local_tables(l2p0, rank, SLOTS, host_l, host_c)
+        stack.load_routing(l0.cuda(), cn0.cuda())
     ids0 = torch.multinomial(phase[0], args.tokens, replacement=True, generator=gen)
     stack.capture(x, local_tokens(ids0, stack.logcnt, args.tokens).cuda().to(torch.int32))
     # exercise the planner once off the clock: first call pays numpy/BLAS import
@@ -220,7 +231,7 @@ def run(policy, args, rank, world, stack, sw):
                     stw_commits += 1
                     act = "recapture" if policy == "stw" else "commit"
                 base_phy2log, stw_last = p2l, step
-        elif policy == "stw_official" and step >= args.warmup \
+        elif official and step >= args.warmup \
                 and step - stw_last >= args.cooldown:
             # DeepSeek EPLB + full reshuffle, applied synchronously. A global
             # reshuffle overwrites slots whose contents later copies still need
@@ -275,13 +286,18 @@ def run(policy, args, rank, world, stack, sw):
                 torch.cuda.synchronize()
                 d = time.perf_counter()
                 l, cn = rank_local_tables(l2p, rank, SLOTS, host_l, host_c)
-                stack.load_routing(l.cuda(), cn.cuda())
-                stack.capture(stack.static_x, stack.static_expert, warmup=0)
+                if policy == "stw_official":
+                    stack.load_routing(l.cuda(), cn.cuda())
+                    stack.capture(stack.static_x, stack.static_expert, warmup=0)
+                    act = "recapture"
+                else:
+                    stack.load_routing(l.cuda(), cn.cuda())
+                    sw.commit(stack.log2phy, l.cuda(), stack.logcnt, cn.cuda())
+                    act = "commit"
                 torch.cuda.synchronize()
                 split.append((step, len(tasks), (b - a) * 1e3, (c - b) * 1e3,
                               (d - c) * 1e3, (time.perf_counter() - d) * 1e3))
                 stw_commits += 1
-                act = "recapture"
                 off_p2l = phy
                 stw_last = step
         t2 = time.perf_counter()
@@ -292,8 +308,8 @@ def run(policy, args, rank, world, stack, sw):
 
         # every rank sees the same traffic mix here, so the local EMA stands in
         # for the global load; only the layout in force differs per policy
-        layout = (ctrl.phy2log if policy == "live"
-                  else off_p2l if policy == "stw_official" else base_phy2log)
+        layout = ctrl.phy2log if policy == "live" \
+            else off_p2l if official else base_phy2log
         load = rank_load(layout, ema * world, RANKS)
         imbalance.append((load.max(-1).values / load.mean(-1).clamp(min=1e-9)).mean().item())
 
@@ -325,10 +341,12 @@ def main():
     ap.add_argument("--cooldown", type=int, default=20)
     ap.add_argument("--check-every", type=int, default=8)
     ap.add_argument("--layers-per-step", type=int, default=4)
-    ap.add_argument("--policies", default="static,stw,stw_inplace,stw_official,live")
+    ap.add_argument("--policies",
+                default="static,stw,stw_inplace,stw_official,stw_official_inplace,live")
     # real Qwen3.6 router decisions from collect_router_trace.py, replacing the
     # synthetic Zipf phases with phaseA_code / phaseB_math_wiki
     ap.add_argument("--trace")
+    ap.add_argument("--init-official", action="store_true")
     ap.add_argument("--out", default="results/stage4_timeline.json")
     args = ap.parse_args()
 

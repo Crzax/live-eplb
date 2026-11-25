@@ -43,6 +43,9 @@ Stage 1-3 分别解决了"搬多少"、"怎么换不重录"、"怎么跨进程�
 - `stw_official` — **DeepSeek 官方 EPLB 规划器 + 全量重排**（每次提交约改 1400/1440 槽），
   先过**双 barrier staging**（这是全量重排必需的两阶段协议，我们的 planner 不需要它）
   再重录。它是外面世界里"停机式 EPLB"的完整账单
+- `stw_official_inplace` — 同样的官方规划 + staging，提交时**只 commit 路由表不重录**。
+  就是你那句"官方难道不能也不重录吗"——能，但省下的只是它的八分之一，
+  大头在它的规划和换手
 - `live` — 本项目：后台线程规划、`transfer_stream` 搬运、非阻塞轮询、原地切表
 
 让它们共触发逻辑是故意的。如果只让 stw 在突变后做一次均衡（第一版就是这么写的），
@@ -58,13 +61,14 @@ Stage 1-3 分别解决了"搬多少"、"怎么换不重录"、"怎么跨进程�
 ### 40 层
 
 ```
-policy      TPOT p50      p99    worst  Max/Mean last100  commits
------------------------------------------------------------------
-static        64.825   65.779   65.991             2.204        0
-stw           64.638  132.639  205.299             1.174       15
-stw_inplace   64.635   67.175   69.867             1.174       15
-stw_official  65.787  386.984  434.449             1.112        6
-live          64.578   65.891   66.023             1.166       12
+policy               TPOT p50      p99    worst  Max/Mean last100  commits
+-------------------------------------------------------------------------------
+static                 64.807   65.730   65.866             2.204        0
+stw                    64.609  133.634  151.912             1.174       15
+stw_inplace            64.618   67.057   69.045             1.174       15
+stw_official           65.787  391.494  533.297             1.112        6
+stw_official_inplace   65.804  305.823  406.839             1.112        6
+live                   64.512   65.887   65.995             1.189       12
 ```
 
 stw 的每一次停机，按阶段拆开（ms）。`drain` 是等本步自己发出的 replay 跑完——
@@ -108,6 +112,17 @@ stw_inplace 跑同一批应用动作——**同样的触发、同样的方案，
 `recap` 一栏从约 50 ms 掉到 1.4 ms——所以 stw_inplace 就是"**LiveEPLB 的方案、但删掉
 异步状态机**"这个对照，而不是"不用 LiveEPLB 的现成方案"。
 
+stw_official_inplace（官方方案 + 原地切表，回答"它难道不能也不重录吗"）
+与 stw_official（重录版）逐段对照——**重录在官方那笔账里只占八分之一，
+大头是它自己的规划和换手**：
+
+```
+policy               step    plan    copy   recap    TPOT   vs p50
+stw_official          10   208.9    83.6    47.1   341.4   +275.6
+stw_official_inplace  10   208.2    84.1     2.6   296.7   +230.9
+                     283   226.9   175.6     2.6   406.8   +341.0
+```
+
 stw_official，完整账单（每次提交约改 1400/1440 槽，双 barrier + staging）：
 
 ```
@@ -118,11 +133,14 @@ stw_official，完整账单（每次提交约改 1400/1440 槽，双 barrier + s
 ```
 
 三个事实一眼看到：
-1. **plan 210-244 ms**：官方 EPLB 的规划本身比我们贵一个量级（Stage 1 的 450 ms），
+1. **plan 208-229 ms**：官方 EPLB 的规划本身比我们贵一个量级（Stage 1 的 450 ms），
    在 stw_official 里这段全程压在关键路径上。
-2. **copy 88-153 ms**：官方重排约一半槽换手、要 staging，不再是毫秒级——还没算两次全集群 barrier。
-3. **平均每次停机 ~400 ms、均衡 1.112**：为这 5%（vs live 1.166）的均衡上限差，
-   付出的是一次停机约四百毫秒 vs stw_inplace 的 ~2 ms。
+2. **copy 72-176 ms**：官方重排约一半槽换手、要 staging、要两次全集群 barrier，
+   不再是毫秒级。
+3. **recap 在官方那笔账里只值八分之一**：`stw_official_inplace` 341 → 297 ms，
+   省不掉真正的大头——**这是 Pinned-Base 用均衡上限还价的精确位置**。
+4. **平均每次停机 ~330-380 ms、均衡 1.112 vs live 1.166**：为这 5% 的均衡上限差，
+   付出的是一次停机三百毫秒以上 vs stw_inplace 的 ~2 ms。
 
 
 ### 1 层（对照）
@@ -154,9 +172,9 @@ stw_inplace    step  83   plan 1.5  drain 0.0  copy 0.5  recap  0.2   TPOT  2.4 
 
 四件事：
 
-**1. live 的最差一步和不做均衡无法区分。** 40 层下 66.023 vs static 的 65.991，**高 0.03 ms**；
-1 层下 1.936 vs 1.762，差 0.17 ms。两者都在 ±0.2 ms 抖动内。stw 的最差一步比 static 高 211%，
-stw_official 高 558%。
+**1. live 的最差一步和不做均衡无法区分。** 最新一轮 40 层下 65.995 vs static 的 65.866，
+**高 0.13 ms**；1 层下 1.777 vs 1.659，差 0.12 ms。都在 ±0.2 ms 抖动内。stw 的最差一步比
+static 高 131%，stw_official **高 710%**（533 ms）、stw_official_inplace 高 518%。
 
 > 这是本项目唯一不随规模漂移的结论，也是该当头条的那一条。
 
@@ -406,19 +424,25 @@ transfer stream:            [peer copy ──────▶ event.record()]─�
 地址带 layer，不同层的 pull 落在 pool 的不同区段。benchmark 里 `verify_replicas()` 每轮
 结束读一次权重里埋的 `(layer, expert)` 指纹，**跨层串写会被查出来**，四个策略都是 0 条。
 
-## 一个没有解释清楚的数字
+## 两个没有解释清楚的数字
 
-四个 policy 的 p50 不是同一个数：40 层 static 64.813 / stw 64.624 / stw_inplace 64.642 /
-live 64.572，最高的 static 和最低的 live 差 0.24 ms。
+**其一：四个均衡组的 p50 不是同一个数。** 40 层 static 64.807 / stw 64.609 / stw_inplace
+64.618 / live 64.512，最高的 static 和最低的 live 差 0.30 ms。各轮重跑顺序也不稳定
+（上一轮是 static > live > stw，这一轮 static > stw_inplace > stw > live）。均衡本身不该让
+单步变快：这个 benchmark 里每步每卡算的 token 数固定，而且**合成 forward 对负载几乎不敏感**
+（下面已知局限）。所以现在的判断是：**0.3 ms 以内的 p50 差异在 run-to-run 抖动里，不该读成
+机制差异**。（历史上 1 层规模出现过一次 stw 比 static 低 4% 的，那一条仍然没有解释。）
 
-均衡本身不该让单步变快：这个 benchmark 里每步每卡算的 token 数固定，而且**合成 forward
-对负载几乎不敏感**（下面已知局限）。三个做均衡的 p50 和 static 完全靠抖动决定先后——
-上一轮的顺序是 static > live > stw，这一轮是 static > stw > stw_inplace > live，
-两次重跑排序就换了一遍。
+**其二：换成官方布局后，每步平白慢 1 ms，排除了四个嫌疑还没确诊。** `stw_official`
+和 `stw_official_inplace` 的 p50 都比同条件组稳高 ~1 ms（合成 vs 65.8，trace vs 66.9），
+起病点是第一次换布局（step 10），之后不再加深。**排除过的**：显存分配（给 static
+同样分配，p50 不变）、每步统计开销（Ctrl 时间一致）、recapture（inplace 组不重录也慢、
+stw 重录 15 次却不慢）、规划器的 Python（只有提交步才跑）。剩下唯一有测量证据的说法是
+**官方布局自身访存形态更差**——static + 官方布局 step 0 就装好、零迁移时 p50 已经
+65.254（+0.45）——但也只解释了约一半。**约 0.55 ms 没有任何更强的说法**。
+详见调试记录 S5-6。它不影响结论方向（对照组更慢反而对我们有利），记下它是因为
+"能解释"和"测量过"是两回事。
 
-所以现在的判断是：**0.24 ms 以内的 p50 差在 run-to-run 抖动里，不该读成机制差异**。
-（历史上 1 层规模出现过一次 stw 比 static 低 4% 的，那一条仍然没解释；40 层的均已落进
-噪声。）不做解释地放着一个反直觉的数字，比硬给一个说法要诚实。
 ## 测试
 
 全套 56 个，`bash benchmarks/stage4_multilayer.sh` 跑完：planner 17、moe_layer 17、

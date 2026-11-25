@@ -84,9 +84,9 @@ then writing a new slot index into the table — the graph never notices.
 
 8×H20, 40 MoE layers (the real depth of the target model), 300 decode steps. stw /
 stw_inplace / live share one trigger, one planner, one copy list — only the way a placement
-is *applied* differs. `stw_official` additionally replaces the planner with DeepSeek's
-official EPLB and applies it the way a production stop-the-world does -- full reshuffle,
-staged two-phase copy, re-capture.
+is *applied* differs. `stw_official` and `stw_official_inplace` additionally replace the
+planner with DeepSeek's official EPLB and apply it the way a production stop-the-world does --
+full reshuffle, staged two-phase copy, with and without re-capture.
 
 ```
 policy      TPOT p50      p99    worst  Max/Mean last100  commits
@@ -94,8 +94,9 @@ policy      TPOT p50      p99    worst  Max/Mean last100  commits
 static        64.825   65.779   65.991             2.204        0
 stw           64.638  132.639  205.299             1.174       15
 stw_inplace   64.635   67.175   69.867             1.174       15
-stw_official  65.787  386.984  434.449             1.112        6
-live          64.578   65.891   66.023             1.166       12
+stw_official           65.787  391.494  533.297             1.112        6
+stw_official_inplace   65.804  305.823  406.839             1.112        6
+live                   64.512   65.887   65.995             1.189       12
 ```
 
 ![TPOT under a traffic shift](docs/figures/timeline_40layer.png)
@@ -103,10 +104,11 @@ live          64.578   65.891   66.023             1.166       12
 - Stop-the-world's stall is **~98% graph re-capture** (46-68 ms each round), which
   `stw_inplace` cancels outright. The remaining ~3 ms of LiveEPLB's edge is the async
   state machine removing planning, copying and the commit round-trip from the critical path.
-- The **official EPLB stop-the-world** pays the full external bill: plan 210-244 ms plus
-  a two-phase staged reshuffle of ~1,400 slots plus re-capture -- **a ~400 ms stall per
-  commit**, roughly 6 decode steps, for Max/Mean 1.112 vs LiveEPLB's 1.166. The 5% balance
-  ceiling of our planner is purchased for three orders of magnitude less application latency.
+- The **official EPLB stop-the-world** pays the full external bill: plan ~220 ms plus a
+  two-phase staged reshuffle of ~1,400 slots (~100 ms) plus re-capture (~50 ms) -- **a ~350 ms
+  stall per commit**, ~5 decode steps, for Max/Mean 1.112 vs LiveEPLB's 1.166. Giving it the
+  in-place commit too saves only ~45 ms: the steepest cost of a global reshuffle is the plan
+  and the turnover, both of which Pinned-Base removes by construction.
 - LiveEPLB's worst step (66.02) sits **within jitter of not rebalancing at all** (65.99),
   while peak rank load drops 47% — and stays there on real router traces too.
 - Honest price: after a traffic shift, LiveEPLB's balance lags the synchronous variants by
