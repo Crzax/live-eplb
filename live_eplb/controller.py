@@ -141,8 +141,8 @@ class LiveEPLBController:
         self.hold_c = self.host_c.clone().pin_memory()  # [L, E]
         self.live_l = shard.log2phy.cpu()               # [L, E, C] mirror, in force
         self.live_c = shard.logcnt.cpu()                # [L, E]
-        # 首启预热：commit kernel 的模块加载 / EMA 的 pageable H2D 第一次都会
-        # 先等掉一整个 decode step（S4-15），趁这会儿还没有 replay 在飞
+        # warm up first-use costs (the commit kernel's module load, the EMA's
+        # pageable H2D; S4-15): each would otherwise wait out a full replay
         self.sw.commit(shard.log2phy, shard.log2phy.clone(),
                        shard.logcnt, shard.logcnt.clone())
         self.record(torch.zeros(self.ema.shape, device=shard.log2phy.device))

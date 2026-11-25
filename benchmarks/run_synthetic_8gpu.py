@@ -179,8 +179,9 @@ def run(policy, args, rank, world, stack, sw):
             act = ctrl.on_step(dev_counts)
         elif policy in ("stw", "stw_inplace") and step >= args.warmup \
                 and step - stw_last >= args.cooldown:
-            # 与 live 共享触发/规划/拷贝，只改"怎么应用"：stw 重录 graph，
-            # stw_inplace 同样原地切表但同步——全部压在关键路径上
+            # same trigger/plan/copies as live; only the application differs.
+            # stw re-captures the graph; stw_inplace commits in place too, but
+            # synchronously -- everything sits on the critical path
             stats = ema * world
             load = rank_load(base_phy2log, stats, RANKS)
             per_layer = load.max(-1).values / load.mean(-1)
@@ -192,8 +193,9 @@ def run(policy, args, rank, world, stack, sw):
                 mine = sw.local_tasks(tasks, SLOTS)
                 b = time.perf_counter()
                 if mine:
-                    # pull_batch 反正要等本步 replay 排完，先显式 drain 才能
-                    # 单量 copy；stw_inplace 靠它证明拷贝不会撞上读，无需摘除表
+                    # pull_batch waits on the in-flight replay anyway; drain it
+                    # first so copy is timed alone, and (for stw_inplace) so an
+                    # overwrite provably cannot race a read
                     torch.cuda.synchronize()
                     c = time.perf_counter()
                     sw.pull_batch(mine).synchronize()
