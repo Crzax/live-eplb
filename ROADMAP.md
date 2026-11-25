@@ -150,14 +150,14 @@ cross-check against `nvidia-smi topo -m`.
 `benchmarks/run_synthetic_8gpu.py`, `benchmarks/plot_stage4.py`,
 `tests/test_controller.py` (11/11). Runs the full 40 layers of the target model.
 
-Results: see `docs/stage4_experiments.md`. Headline — identical triggers and plans for all four
-policies; **LiveEPLB's worst step is indistinguishable from not rebalancing at all** (66.166 vs
-static's 66.528 ms, i.e. 0.36 below) while stop-the-world's is 86% above (123.5 ms). A fourth
-policy, `stw_inplace`, applies the same plan synchronously but with the in-place commit instead
-of a re-capture: worst 69.03. So **the routing-table indirection accounts for 96% of the stall**
-(123.5 → 69.03) and **the async state machine for the remaining 2.9 ms**.
-Max/Mean over the last 100 steps 2.204 (static) → 1.166 (live) → 1.174 (both stop-the-world
-variants) — but live stays worse than stop-the-world for ~45 steps after the shift.
+Results: see `docs/stage4_experiments.md`. Headline — identical triggers and plans for stw /
+stw_inplace / live; **LiveEPLB's worst step is indistinguishable from not rebalancing at all**
+(66.02 vs static's 65.99 ms) while stop-the-world's is 211% above (205.3 ms). A fourth policy,
+`stw_inplace`, applies the same plan synchronously but commits in place: worst 69.9, so the
+routing-table indirection accounts for ~97% of the stall and the async state machine for the
+remaining ~4 ms. A fifth, `stw_official`, uses DeepSeek's own EPLB + full reshuffle: ~400 ms
+per commit for Max/Mean 1.112 vs live's 1.166 — the external-market price of "stop-the-world
+EPLB", which brackets the whole trade-off.
 
 Key findings:
 - **Three slot id spaces, and only one of them carries the layer.** The planner works in global

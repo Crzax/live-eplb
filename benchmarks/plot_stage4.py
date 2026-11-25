@@ -11,6 +11,7 @@ OUT = "results/synthetic_tpot_timeline.png"
 STYLE = {"static": ("#888888", "Static EP (no balancing)"),
          "stw": ("#d62728", "Stop-The-World EPLB (re-capture)"),
          "stw_inplace": ("#e4572e", "Stop-The-World, in-place commit"),
+         "stw_official": ("#9467bd", "Stop-The-World, official EPLB + reshuffle"),
          "live": ("#1f77b4", "LiveEPLB")}
 
 
@@ -43,7 +44,8 @@ def main():
 
     for p, mark, label in (("live", "commit", "LiveEPLB in-place commit (async)"),
                            ("stw_inplace", "commit", "STW in-place commit (sync)"),
-                           ("stw", "recapture", "STW re-capture")):
+                           ("stw", "recapture", "STW re-capture"),
+                           ("stw_official", "recapture", "STW official re-capture")):
         at = [i for i, a in enumerate(d[p]["actions"]) if a == mark]
         c = STYLE[p][0]
         ax2.plot(at, [d[p]["imbalance"][i] for i in at], "v", color=c, ms=7)

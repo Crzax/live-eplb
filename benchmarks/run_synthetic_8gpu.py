@@ -1,10 +1,13 @@
-"""Stage 4: TPOT under a traffic shift, three policies, a full stack of layers.
+"""Stage 4: TPOT under a traffic shift, a full stack of layers.
 
 torchrun --nproc_per_node=8 benchmarks/run_synthetic_8gpu.py
 
-  static  - no balancing at all
-  stw     - plan, copy synchronously, re-capture the graph (what EPLB costs today)
-  live    - plan, stage in background, commit the table in place
+  static       - no balancing at all
+  stw          - our planner, copy synchronously, re-capture the graph
+  stw_inplace  - our planner, copy synchronously, commit the table in place
+  stw_official - DeepSeek's official EPLB planner + full reshuffle (staging a
+                 pool-sized buffer to break copy cycles) + re-capture
+  live         - our planner, stage in background, commit the table in place
 """
 import argparse, json, os, sys, time
 
@@ -13,7 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.distributed as dist
 
+import live_eplb_cuda as _C
 from live_eplb.controller import LiveEPLBController, rank_local_tables
+from live_eplb.eplb_official import rebalance_experts
 from live_eplb.moe_layer import MoEStack
 from live_eplb.p2p import P2PSwapper
 from live_eplb.planner import plan_incremental_redundant, rank_load, static_phy2log
@@ -131,6 +136,9 @@ def run(policy, args, rank, world, stack, sw):
                                   check_every=args.check_every)
 
     base_phy2log = static_phy2log(L, RANKS, EPR, RED)
+    off_p2l = base_phy2log.clone()      # placement in force for stw_official
+    staging = (torch.empty_like(stack.w_pool) if policy == "stw_official"
+               else None)
     ema = torch.zeros(L, EXPERTS)
     tpot, actions, imbalance, ctrl_ms, split = [], [], [], [], []
     stw_last, stw_commits = -args.cooldown, 0
@@ -212,7 +220,70 @@ def run(policy, args, rank, world, stack, sw):
                     stw_commits += 1
                     act = "recapture" if policy == "stw" else "commit"
                 base_phy2log, stw_last = p2l, step
-
+        elif policy == "stw_official" and step >= args.warmup \
+                and step - stw_last >= args.cooldown:
+            # DeepSeek EPLB + full reshuffle, applied synchronously. A global
+            # reshuffle overwrites slots whose contents later copies still need
+            # as sources (cycles), so the copy is staged through a scratch
+            # buffer the size of the pool -- the extra traffic a two-phase
+            # commit has to pay, and the thing Pinned-Base avoids by design.
+            stats = ema * world
+            load = rank_load(off_p2l, stats, RANKS)
+            per_layer = load.max(-1).values / load.mean(-1)
+            if (per_layer > args.threshold).any():
+                a = time.perf_counter()
+                phy, l2p, _ = rebalance_experts(stats, RANKS * SLOTS, 1, 1, RANKS)
+                b = time.perf_counter()
+                tasks = []
+                for l in range(L):
+                    prev_row = off_p2l[l].tolist()
+                    new_row = phy[l].tolist()
+                    first = {}
+                    for g, e in enumerate(prev_row):
+                        if e >= 0 and e not in first:
+                            first[e] = g
+                    for g in range(rank * SLOTS, (rank + 1) * SLOTS):
+                        e_new = new_row[g]
+                        if e_new >= 0 and e_new != prev_row[g]:
+                            g2 = first[e_new]
+                            tasks.append((l * SLOTS + g % SLOTS, g2 // SLOTS,
+                                          l * SLOTS + g2 % SLOTS))
+                torch.cuda.synchronize()
+                c = time.perf_counter()
+                # a global reshuffle is a two-phase commit across the whole
+                # cluster: every rank stages its pulls first, and only then
+                # may anyone overwrite pool slots -- otherwise a pull can meet
+                # a concurrent overwrite of its source by the owner rank
+                dist.barrier()
+                s = sw.stream
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for i, (_, sr, sp) in enumerate(tasks):
+                        if sr == rank:      # a reshuffle can also be a local move
+                            staging[i].copy_(stack.w_pool[sp],
+                                             non_blocking=True)
+                        else:
+                            _C.async_copy_expert_slot(staging, i, sr, sp,
+                                                      sw.slot_bytes,
+                                                      s.cuda_stream)
+                s.synchronize()     # my stage buffer is complete
+                dist.barrier()      # ... on every rank, so remote sources are
+                                    # no longer read by anyone
+                with torch.cuda.stream(s):
+                    for i, (dp, _, _) in enumerate(tasks):
+                        stack.w_pool[dp].copy_(staging[i], non_blocking=True)
+                torch.cuda.synchronize()
+                d = time.perf_counter()
+                l, cn = rank_local_tables(l2p, rank, SLOTS, host_l, host_c)
+                stack.load_routing(l.cuda(), cn.cuda())
+                stack.capture(stack.static_x, stack.static_expert, warmup=0)
+                torch.cuda.synchronize()
+                split.append((step, len(tasks), (b - a) * 1e3, (c - b) * 1e3,
+                              (d - c) * 1e3, (time.perf_counter() - d) * 1e3))
+                stw_commits += 1
+                act = "recapture"
+                off_p2l = phy
+                stw_last = step
         t2 = time.perf_counter()
         torch.cuda.synchronize()
         tpot.append((time.perf_counter() - t0) * 1e3)
@@ -221,7 +292,8 @@ def run(policy, args, rank, world, stack, sw):
 
         # every rank sees the same traffic mix here, so the local EMA stands in
         # for the global load; only the layout in force differs per policy
-        layout = ctrl.phy2log if policy == "live" else base_phy2log
+        layout = (ctrl.phy2log if policy == "live"
+                  else off_p2l if policy == "stw_official" else base_phy2log)
         load = rank_load(layout, ema * world, RANKS)
         imbalance.append((load.max(-1).values / load.mean(-1).clamp(min=1e-9)).mean().item())
 
@@ -253,7 +325,7 @@ def main():
     ap.add_argument("--cooldown", type=int, default=20)
     ap.add_argument("--check-every", type=int, default=8)
     ap.add_argument("--layers-per-step", type=int, default=4)
-    ap.add_argument("--policies", default="static,stw,stw_inplace,live")
+    ap.add_argument("--policies", default="static,stw,stw_inplace,stw_official,live")
     # real Qwen3.6 router decisions from collect_router_trace.py, replacing the
     # synthetic Zipf phases with phaseA_code / phaseB_math_wiki
     ap.add_argument("--trace")

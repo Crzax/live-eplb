@@ -82,25 +82,32 @@ then writing a new slot index into the table — the graph never notices.
 
 ## Results at a Glance
 
-8×H20, 40 MoE layers (the real depth of the target model), 300 decode steps, four policies
-sharing one trigger, one planner, one copy list — only the way a new placement is *applied*
-differs:
+8×H20, 40 MoE layers (the real depth of the target model), 300 decode steps. stw /
+stw_inplace / live share one trigger, one planner, one copy list — only the way a placement
+is *applied* differs. `stw_official` additionally replaces the planner with DeepSeek's
+official EPLB and applies it the way a production stop-the-world does -- full reshuffle,
+staged two-phase copy, re-capture.
 
 ```
 policy      TPOT p50      p99    worst  Max/Mean last100  commits
 -----------------------------------------------------------------
-static        64.813   65.809   66.528             2.204        0
-stw           64.624  116.972  123.538             1.174       15
-stw_inplace   64.642   66.973   69.030             1.174       15
-live          64.572   66.019   66.166             1.166       12
+static        64.825   65.779   65.991             2.204        0
+stw           64.638  132.639  205.299             1.174       15
+stw_inplace   64.635   67.175   69.867             1.174       15
+stw_official  65.787  386.984  434.449             1.112        6
+live          64.578   65.891   66.023             1.166       12
 ```
 
 ![TPOT under a traffic shift](docs/figures/timeline_40layer.png)
 
-- Stop-the-world's stall is **98.1% graph re-capture** (46–112 ms each round), which
-  `stw_inplace` cancels outright. The remaining ~2.9 ms of LiveEPLB's edge is the async
+- Stop-the-world's stall is **~98% graph re-capture** (46-68 ms each round), which
+  `stw_inplace` cancels outright. The remaining ~3 ms of LiveEPLB's edge is the async
   state machine removing planning, copying and the commit round-trip from the critical path.
-- LiveEPLB's worst step (66.17) sits **within jitter of not rebalancing at all** (66.53),
+- The **official EPLB stop-the-world** pays the full external bill: plan 210-244 ms plus
+  a two-phase staged reshuffle of ~1,400 slots plus re-capture -- **a ~400 ms stall per
+  commit**, roughly 6 decode steps, for Max/Mean 1.112 vs LiveEPLB's 1.166. The 5% balance
+  ceiling of our planner is purchased for three orders of magnitude less application latency.
+- LiveEPLB's worst step (66.02) sits **within jitter of not rebalancing at all** (65.99),
   while peak rank load drops 47% — and stays there on real router traces too.
 - Honest price: after a traffic shift, LiveEPLB's balance lags the synchronous variants by
   ~35 steps (peak Max/Mean 2.09 vs 1.28) — latency tail vs. recovery speed, by design.
@@ -121,7 +128,7 @@ assignments): the same trade holds — LiveEPLB moves **10.8× less data than a 
 | `live_eplb/controller.py` | Async state machine: EMA collection, planning, non-blocking copy polling, commit |
 | `csrc/p2p_swapper.cu` | CUDA IPC handles, `cudaMemcpyPeerAsync`, single-launch routing commit kernel |
 | `live_eplb/p2p.py` | Handle exchange, coalesced peer pulls, per-rank task filtering |
-| `benchmarks/run_synthetic_8gpu.py` | 8×H20 TPOT benchmark, four policies under a traffic shift |
+| `benchmarks/run_synthetic_8gpu.py` | 8×H20 TPOT benchmark, five policies under a traffic shift |
 | `benchmarks/collect_router_trace.py` | Forward hooks on the 40 MoE gates → real routing counts |
 | `live_eplb/eplb_official.py` | DeepSeek EPLB, vendored verbatim, comparison baseline only |
 
