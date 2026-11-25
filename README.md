@@ -275,6 +275,18 @@ decode step grows 39x. The scale-independent claim is the first one. Full analys
 the per-layer trigger replaced a stack-average one, and four measurement bugs that each flattered
 this project — is in [`docs/stage4_experiments.md`](docs/stage4_experiments.md).
 
+Then the same questions were re-asked on **real Qwen3.6 router traces** (48 prompts, code vs
+math/Chinese-wiki domains, hooks on all 40 MoE routers — Stage 5):
+
+- Real traffic is milder but layer-heterogeneous: static Max/Mean 1.61-1.68 mean with single
+  layers from 1.03 to 2.60 — exactly the input the per-layer gate was designed for.
+- LiveEPLB still moves 11.7x less data than the official reshuffle (6.04 GB vs 70.47 GB) for
+  1.085 vs 1.001 balance.
+- LiveEPLB's worst step stays within jitter of static's (+0.24 ms); stw_inplace closes 96% of
+  the stop-the-world stall, live the remaining 2.84 ms; live's convergence lag shrinks to
+  ~37 steps with a peak balance gap of 0.20 (it was 45 steps / 0.81 on the synthetic shift,
+  which overshoots how far real domains move the routing).
+
 ## The trade-off
 
 The planner is not strictly better than the official one — it occupies a different point:
@@ -311,7 +323,7 @@ latency budget.
 | 2 | Single-GPU CUDA Graph in-place swap, zero re-capture | **done** |
 | 3 | CUDA IPC + `cudaMemcpyPeerAsync` NVLink P2P engine | **done** |
 | 4 | Async state machine + 8x H20 TPOT benchmark | **done** |
-| 5 | Real router traces from Qwen3.6-35B-A3B | todo |
+| 5 | Real router traces from Qwen3.6-35B-A3B | **done** |
 
 Target model: `Qwen/Qwen3.6-35B-A3B` — 40 MoE layers, 256 routed experts, top-8 routing,
 `moe_intermediate_size=512`, plus 1 shared expert. One routed expert is
@@ -351,7 +363,9 @@ live-eplb/
 │   ├── stage3_experiments.md   <- IPC, bandwidth vs coalescing, HBM contention
 │   ├── stage3_debug_notes.md   <- parameter-semantics drift, a wrong hardware assumption
 │   ├── stage4_experiments.md   <- the TPOT benchmark, what "zero downtime" costs
-│   └── stage4_debug_notes.md   <- fifteen bugs, four rounds of chasing the same spike
+│   ├── stage4_debug_notes.md   <- fifteen bugs, four rounds of chasing the same spike
+│   ├── stage5_experiments.md   <- real router traces, skew heatmap, everything re-measured
+│   └── stage5_debug_notes.md   <- three environment/workflow bugs
 ├── setup.py
 └── ROADMAP.md                  <- per-stage specs and known pitfalls
 ```

@@ -16,7 +16,9 @@ STYLE = {"static": ("#888888", "Static EP (no balancing)"),
 
 def main():
     shift_at = int(sys.argv[1]) if len(sys.argv) > 1 else 80
-    d = json.load(open(SRC))
+    src = sys.argv[2] if len(sys.argv) > 2 else SRC
+    out = sys.argv[3] if len(sys.argv) > 3 else OUT
+    d = json.load(open(src))
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True,
                                    gridspec_kw={"height_ratios": [2, 1]})
@@ -52,8 +54,8 @@ def main():
 
     os.makedirs("results", exist_ok=True)
     fig.tight_layout()
-    fig.savefig(OUT, dpi=150)
-    print(f"wrote {OUT}")
+    fig.savefig(out, dpi=150)
+    print(f"wrote {out}")
 
 
 if __name__ == "__main__":

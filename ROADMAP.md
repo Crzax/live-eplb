@@ -238,21 +238,34 @@ Key findings:
 
 This plot is the central piece of evidence. Report TPOT P50 / P99 / worst single step.
 
-## Stage 5 — Real router traces
+## Stage 5 — Real router traces — DONE
 
-Scope deliberately narrowed: loading the full 35B weights and monkey-patching an end-to-end
-`generate()` is dropped. It is a large amount of work, easy to get stuck on HF version and
-multimodal architecture details, and adds little over Stages 2-4.
+`benchmarks/collect_router_trace.py`, `benchmarks/plan_on_trace.py`,
+`run_synthetic_8gpu.py --trace`. Results: see `docs/stage5_experiments.md`. All 40 gates of the
+real Qwen3.6-35B-A3B hooked for 48 prompts across two domains (code vs math/Chinese-wiki); the
+same four-policy benchmark re-run on the collected counts.
 
-Instead, do one thing: **replace the synthetic Zipf load with real router traces**, to show the
-gains are not an artifact of the synthetic distribution.
+Headline — **nothing from Stage 1-4 was an artifact of the synthetic load**:
 
-1. Load the model (`trust_remote_code`), collect real `topk_ids [tokens, 8]` from all 40 gates via
-   forward hooks. Domain shift: phase A code-generation prompts, phase B math / encyclopedia
-   prompts, 50-100 each. Trace collection only — release the model afterwards.
-2. Re-run the Stage 1 comparison and the Stage 4 benchmark on real traces. Report per-layer
-   Max/Mean before and after the shift (heatmap), migration volume, and TPOT gains.
+- Real traffic is milder (static Max/Mean 1.61-1.68, not 2.2) but layer-heterogeneous
+  (1.03 to 2.60); the two domains share only ~2/8 hot experts per layer, so the shift is real.
+- The trade-off is identical: LiveEPLB moves 6.04 GB vs the official reshuffle's 70.47 GB
+  (**11.7x**, the same factor as on Zipf) for 1.085 vs 1.001 balance; worst layer 1.330.
+- LiveEPLB's worst step is +0.24 ms over static's (in jitter); stw_inplace closes 96% of the
+  stall again (167.1 -> 70.5); live vs stw_inplace is 2.84 ms again (was 2.86).
+- LiveEPLB's convergence lag shrinks to ~37 steps with a peak gap of 0.20 (the synthetic
+  domain shift was extreme, 0.81): real domains move routing less, and per-layer incremental
+  planning is at its best when only some layers need fixing.
 
+Key findings:
+- **The per-layer gate finally met the input it was designed for.** Synthetic Zipf made every
+  layer equally skewed, so max == mean and the per-layer trigger could not show its value;
+  real traces give layer-to-layer ratios of 1.03 to 2.60, and a stack-average gate would hide
+  exactly those layers.
+- `transformers_version` in a config is the version that *wrote* the file, not the minimum
+  version that can *run* it — the model class only exists in transformers 5.x (S5-3).
+- Prefill-only, 48-prompt traces are thin (see limitations in the experiments doc): they
+  resolve each layer's hot experts but not the tail. Enough to falsify "synthetic-only".
 Migration volume, now measured rather than estimated: a Stage 4 commit at 40 layers moves between
 **1 and 138 slots** (6 MB to 868 MB per rank) and the copy itself takes **0.1-3.0 ms**. Three
 earlier figures in this file were wrong: "< 2 ms" was optimistic, the "6.57 GB / ~19 ms" correction

@@ -137,7 +137,13 @@ def run(policy, args, rank, world, stack, sw):
     host_l = torch.full(tuple(stack.log2phy.shape), -1, dtype=torch.int32)
     host_c = torch.zeros(tuple(stack.logcnt.shape), dtype=torch.int32)
 
-    phase = [phase_probs(L, args.alpha, 0), phase_probs(L, args.alpha, args.drift)]
+    if args.trace:
+        td = torch.load(args.trace, weights_only=False)
+        phase = [td["phases"][k]["counts"][:L].float() + 1e-6
+                 for k in ("phaseA_code", "phaseB_math_wiki")]
+    else:
+        phase = [phase_probs(L, args.alpha, 0),
+                 phase_probs(L, args.alpha, args.drift)]
     # counts are generated on the host here; stage them pinned, as a .cuda() on
     # pageable memory would block until the stream drains and charge the whole
     # decode step to the controller
@@ -252,6 +258,9 @@ def main():
     ap.add_argument("--check-every", type=int, default=8)
     ap.add_argument("--layers-per-step", type=int, default=4)
     ap.add_argument("--policies", default="static,stw,stw_inplace,live")
+    # real Qwen3.6 router decisions from collect_router_trace.py, replacing the
+    # synthetic Zipf phases with phaseA_code / phaseB_math_wiki
+    ap.add_argument("--trace")
     ap.add_argument("--out", default="results/stage4_timeline.json")
     args = ap.parse_args()
 
