@@ -8,12 +8,18 @@ Verified config (`config.json`): `Qwen3_5MoeForConditionalGeneration`, MoE param
 Constraint: core code stays under ~800 lines. Every stage must be runnable and measured — no
 pseudo-code, no placeholder results.
 
+As of Stage 4: **872 lines**, over the ~800 budget, across `controller.py` (371),
+`moe_layer.py` (207), `planner.py` (170) and `p2p.py` (124), plus 136 lines of CUDA.
+`eplb_official.py` is a vendored reference implementation used for comparison and is not counted.
+The overrun came from the per-layer re-plan and the constructor warmups; it is not compressible
+without dropping a correctness guard, so the budget is recorded as exceeded rather than met.
+
 ---
 
 ## Stage 1 — Bounded incremental planner — DONE
 
 `live_eplb/planner.py`, `tutorials/01_eplb_diff.py`, `tutorials/01b_ablation.py`,
-`tests/test_planner.py` (14/14).
+`tests/test_planner.py` (17/17, three of them covering the per-layer re-plan added in Stage 4).
 
 Results and reasoning: see `README.md` and `docs/stage1_debug_notes.md`.
 
@@ -37,7 +43,8 @@ Key findings:
 
 ## Stage 2 — CUDA Graph in-place weight swap (single GPU) — DONE
 
-`live_eplb/moe_layer.py`, `tutorials/02_cudagraph_swap.py`, `tests/test_moe_layer.py` (14/14).
+`live_eplb/moe_layer.py`, `tutorials/02_cudagraph_swap.py`, `tests/test_moe_layer.py` (17/17,
+three of them covering the `MoEStack` added in Stage 4).
 
 Results: see `docs/stage2_experiments.md`. Headline numbers — `commit_routing()` 0.033 ms vs full
 re-capture 25.164 ms (11.1x a decode step), zero re-captures across all four experiments, and a
@@ -137,9 +144,74 @@ Pitfalls:
 Acceptance: bit-wise identical data after the copy; report single-slot and 40-layer bandwidth and
 cross-check against `nvidia-smi topo -m`.
 
-## Stage 4 — Async state machine + 8x H20 benchmark
+## Stage 4 — Async state machine + 8x H20 benchmark — DONE
 
-`live_eplb/controller.py`, `benchmarks/run_synthetic_8gpu.py`
+`live_eplb/controller.py`, `live_eplb/moe_layer.py` (`MoEStack`),
+`benchmarks/run_synthetic_8gpu.py`, `benchmarks/plot_stage4.py`,
+`tests/test_controller.py` (11/11). Runs the full 40 layers of the target model.
+
+Results: see `docs/stage4_experiments.md`. Headline — identical triggers and plans for all three
+policies; **LiveEPLB's worst step is within jitter of not rebalancing at all** (66.143 vs 65.944 ms,
+and that step was a cooldown step where the controller spent 0.07 ms) while stop-the-world's is
+110% above (138.7 ms). Max/Mean over the last 100 steps 2.204 (static) → 1.166 (live) →
+1.174 (stop-the-world) — but live stays worse than stop-the-world for ~45 steps after the shift.
+
+Key findings:
+- **Three slot id spaces, and only one of them carries the layer.** The planner works in global
+  slots, a shard's routing table in layer-local ones, and a copy task in pool ids
+  (`layer * spr + local`). Keeping the table layer-local is what lets the commit kernel, `_route`
+  and `P2PSwapper` stay untouched from the single-layer version.
+- **The stop-the-world cost is graph re-capture, nothing else.** Over 15 stalls,
+  `sum(copy + re-capture)` is 811.6 ms against `sum(TPOT - p50)` of 812.0 ms, and re-capture is
+  98.6% of it. Planning is free because it overlaps the replay the step launched anyway. One stall
+  migrated a **single** expert and still paid 49.3 ms. So the thing to attack is not the volume of
+  the copy but the existence of the re-capture.
+- **A flat tail is paid for in recovery speed.** Steady-state balance matches stop-the-world, but
+  for ~45 steps after a traffic shift LiveEPLB is worse (2.089 vs 1.283 at the peak): its first
+  correction lands 11 steps later, because its cooldown clock only restarts at commit, and a
+  per-layer re-plan needs several rounds. This is a trade, not a free win.
+- **"N times better" is a function of layer count.** 38.7x at 1 layer, 2.1x at 40 — re-capture
+  barely grows with depth while a decode step grows 39x. The scale-independent claim is the
+  worst-step one.
+- **A per-layer judgement must not drive a whole-stack action.** Redundant slots are per layer, so
+  40 layers are 40 independent subproblems. The first version gated on the stack-average
+  imbalance, which hides a badly skewed layer behind the rest: 11 skewed layers out of 40 cost 32%
+  of step time while the average reads 1.32, under the 1.35 threshold. Switching the gate to `max`
+  was worse — it never converges and re-triggers every cooldown. The fix is to re-plan only the
+  layers above threshold, plus a guard that a re-plan may never raise a layer's peak rank load.
+- **Only measuring TPOT cannot find a CPU-side stall.** Three of them (`self.ema.cpu()`, the first
+  `commit` launch, the first `record()`) each blocked the caller for ~65 ms without moving TPOT by
+  a microsecond, because each overlapped the replay it was waiting on. A separate CPU timer per
+  step is what exposed them; pushing the scale from 1 to 40 layers is what made the first one
+  large enough to notice.
+- **"Off the critical path" is not one switch but four.** The same spike had to be chased four
+  times: planning inline (33.7 ms), a GIL-holding Python loop inside the worker thread (113.9 ms
+  against 4.9 ms of real planning), an `async_op=True` NCCL collective whose kernel spins on the
+  GPU and exposes rank skew (up to 50 ms), and finally `threading.Thread.start()` itself on a
+  loaded node (47 ms). Two more Python loops were later found inside the planner itself
+  (66.9 ms and 9.6 ms), which is the same bug class recurring a month later.
+- **A 1 KB all-reduce is not cheap because it is small.** The cost is synchronisation, not
+  bandwidth: it stalls everyone behind the slowest rank. Moving it to a gloo group in a background
+  thread, on an unconditional fixed cadence, removes both the GPU interference and the
+  state-dependent deadlock risk.
+- **Stage 2's "an unused slot receives no tokens" expires after the first migration.** The second
+  plan overwrites slots that still serve the first plan's replicas, so the table must retract them
+  first. This is exactly what xLLM's prepare/activate protocol is for; Pinned-Base removes it only
+  for base slots.
+- **A "has the statistic moved enough" gate can lock in a broken layout.** The first plan after a
+  shift sees half-shifted statistics, fails to lower the imbalance, and the gate then reads
+  "nothing changed, no need to re-plan".
+- **The baseline must share the trigger.** Letting stop-the-world rebalance once is a strawman:
+  its worse balance then comes from being called less often, not from the mechanism.
+- Benchmark trap: re-drawing the hot set every step makes every expert equally hot on average, so
+  no placement can win and the measured Max/Mean is pure sampling noise (1.28 measured vs 2.23
+  structural). Offline recomputation of the same quantity is what caught it. Two more traps in the
+  same file, both flattering this project: timing `pull_batch` without draining first charges the
+  in-flight replay to the copy (which made an earlier "320 GB/s" figure accidentally right), and
+  reading the controller's `phy2log` credits a new placement's balance from the start of COPYING
+  rather than from the commit.
+
+### Original spec, kept for reference
 
 `LiveEPLBController`:
 - EMA load tracking: `ema = 0.9 * ema + 0.1 * step_counts`
@@ -178,11 +250,14 @@ gains are not an artifact of the synthetic distribution.
 2. Re-run the Stage 1 comparison and the Stage 4 benchmark on real traces. Report per-layer
    Max/Mean before and after the shift (heatmap), migration volume, and TPOT gains.
 
-Correction to an earlier estimate: "40 layers migrated in < 2 ms" is wrong by an order of
-magnitude. At 6.57 GB and ~350 GB/s effective NVLink bandwidth it is **~19 ms**; a single layer
-(~200 MB) is the 0.5 ms figure. This does not change the conclusion — background copying at 19 ms
-still blocks nothing, it only shifts which step commits. The metric is therefore **TPOT jitter**,
-not total migration time.
+Migration volume, now measured rather than estimated: a Stage 4 commit at 40 layers moves between
+**1 and 138 slots** (6 MB to 868 MB per rank) and the copy itself takes **0.1-3.0 ms**. Three
+earlier figures in this file were wrong: "< 2 ms" was optimistic, the "6.57 GB / ~19 ms" correction
+assumed a full redundant-slot refresh while the incremental planner only rewrites what changed,
+and the "~320 GB/s" back-calculation was derived from a copy timing that had the in-flight replay
+folded into it. The metric remains **TPOT jitter**, not total migration time: copying is 1.4% of a
+stop-the-world stall and planning is free (it overlaps the replay the step launched anyway), so
+**98.6% of the stall is graph re-capture**.
 
 ## Deliverables
 

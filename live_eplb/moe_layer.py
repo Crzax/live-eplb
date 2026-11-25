@@ -4,8 +4,12 @@ A graph bakes kernel arguments, including weight pointers, at capture time. So
 W_pool / log2phy / logcnt / cursor are allocated once and only ever mutated in
 place; the captured forward reads a slot index from log2phy instead of closing
 over a weight address.
+
+One shard is **one MoE layer** of one rank, and its slot ids are rank-local, so
+none of its tensors carry a layer dim. A whole model is a MoEStack of them; see
+its docstring for how the layer gets folded into a pool slot id.
 """
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -15,16 +19,26 @@ GATE, UP, DOWN = 0, 1, 2
 class GraphSafeMoEShard:
     def __init__(self, experts: int = 256, slots: int = 36, hidden: int = 2048,
                  moe_inter: int = 512, max_replicas: int = 8,
-                 device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
+                 device: str = "cuda", dtype: torch.dtype = torch.bfloat16,
+                 views: Optional[Tuple[torch.Tensor, ...]] = None):
+        """views = (w_pool [slots, 3, moe_inter, hidden], log2phy [E, C],
+        logcnt [E], cursor [E]) carved out of a MoEStack's tensors; allocated
+        here when absent."""
         self.experts, self.slots = experts, slots
         self.hidden, self.moe_inter = hidden, moe_inter
         self.device, self.dtype = torch.device(device), dtype
 
-        self.w_pool = torch.zeros(slots, 3, moe_inter, hidden, device=device, dtype=dtype)
-        self.log2phy = torch.full((experts, max_replicas), -1, dtype=torch.int32, device=device)
-        self.logcnt = torch.zeros(experts, dtype=torch.int32, device=device)
-        # per-expert round-robin offset; on-device or it would be folded into the graph
-        self.cursor = torch.zeros(experts, dtype=torch.int64, device=device)
+        if views is None:
+            # [slots, 3, moe_inter, hidden], the 3 being gate / up / down
+            self.w_pool = torch.zeros(slots, 3, moe_inter, hidden, device=device, dtype=dtype)
+            # [experts, max_replicas] expert -> its slots in this pool, -1 padded
+            self.log2phy = torch.full((experts, max_replicas), -1, dtype=torch.int32, device=device)
+            self.logcnt = torch.zeros(experts, dtype=torch.int32, device=device)   # [experts]
+            # [experts] per-expert round-robin offset; on-device or it would be
+            # folded into the graph
+            self.cursor = torch.zeros(experts, dtype=torch.int64, device=device)
+        else:
+            self.w_pool, self.log2phy, self.logcnt, self.cursor = views
 
         self._base_ptrs = (self.w_pool.data_ptr(), self.log2phy.data_ptr(),
                            self.logcnt.data_ptr(), self.cursor.data_ptr())
@@ -128,3 +142,66 @@ class GraphSafeMoEShard:
             self.cursor.fill_(value)
         else:
             self.cursor[expert] = value
+
+
+class MoEStack:
+    """num_layers shards of one rank, over one weight pool and one routing
+    table, captured as a single graph.
+
+    w_pool   [L * slots, 3, moe_inter, hidden]; layer l owns [l*slots, (l+1)*slots)
+    log2phy  [L, experts, max_replicas] slot ids, layer-local and -1 padded
+    logcnt   [L, experts]
+    cursor   [L, experts]
+
+    Two slot id spaces meet here. The tables stay layer-local, because a shard
+    indexes its own pool view; a migration addresses the whole pool and so
+    carries the layer:
+
+        pool_slot = layer * slots + layer_local_slot
+
+    That split is why P2PSwapper needs no layer dim and the commit kernel still
+    sees one contiguous table.
+    """
+
+    def __init__(self, num_layers: int, experts: int = 256, slots: int = 36,
+                 hidden: int = 2048, moe_inter: int = 512, max_replicas: int = 8,
+                 device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
+        self.num_layers, self.slots, self.experts = num_layers, slots, experts
+        self.hidden, self.moe_inter = hidden, moe_inter
+        self.device, self.dtype = torch.device(device), dtype
+
+        self.w_pool = torch.zeros(num_layers * slots, 3, moe_inter, hidden,
+                                  device=device, dtype=dtype)
+        self.log2phy = torch.full((num_layers, experts, max_replicas), -1,
+                                  dtype=torch.int32, device=device)
+        self.logcnt = torch.zeros(num_layers, experts, dtype=torch.int32, device=device)
+        self.cursor = torch.zeros(num_layers, experts, dtype=torch.int64, device=device)
+        self.layers: List[GraphSafeMoEShard] = [
+            GraphSafeMoEShard(experts, slots, hidden, moe_inter, max_replicas,
+                              device, dtype,
+                              views=(self.w_pool[l * slots:(l + 1) * slots],
+                                     self.log2phy[l], self.logcnt[l], self.cursor[l]))
+            for l in range(num_layers)]
+
+        self._base_ptrs = (self.w_pool.data_ptr(), self.log2phy.data_ptr(),
+                           self.logcnt.data_ptr(), self.cursor.data_ptr())
+        self.graph: Optional[torch.cuda.CUDAGraph] = None
+        self.replays = 0
+        self.captures = 0
+
+    def forward(self, x: torch.Tensor, expert: torch.Tensor) -> torch.Tensor:
+        """x [T, hidden], expert [L, T] -> [T, hidden]; layers chained, each
+        routing its own tokens."""
+        for l, sh in enumerate(self.layers):
+            x = sh.forward(x, expert[l])
+        return x
+
+    def load_expert(self, pool_slot: int, w: torch.Tensor) -> None:
+        assert w.shape == (3, self.moe_inter, self.hidden), w.shape
+        self.w_pool[pool_slot].copy_(w)
+
+    # identical bodies: they only touch self.forward / self.graph / _base_ptrs
+    load_routing = GraphSafeMoEShard.load_routing
+    assert_addresses_pinned = GraphSafeMoEShard.assert_addresses_pinned
+    capture = GraphSafeMoEShard.capture
+    replay = GraphSafeMoEShard.replay

@@ -6,6 +6,7 @@ import torch.distributed as dist
 
 import live_eplb_cuda as _C
 
+# (layer, src_rank, src_slot, dst_rank, dst_slot, expert); slots are rank-local
 CopyTask = Tuple[int, int, int, int, int, int]
 
 
@@ -66,7 +67,12 @@ class P2PSwapper:
 
     def pull_batch(self, tasks: Sequence[Tuple[int, int, int]],
                    stream: Optional[torch.cuda.Stream] = None) -> torch.cuda.Event:
-        """tasks = [(dst_slot, src_rank, src_slot)]; returns an event to poll."""
+        """tasks = [(dst_slot, src_rank, src_slot)]; returns an event to poll.
+
+        Waits on the current stream first, so anything already enqueued there
+        -- a replay, a commit -- completes before a slot is overwritten. The
+        caller must therefore issue this from the stream it replays on.
+        """
         s = stream or self.stream
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -76,24 +82,39 @@ class P2PSwapper:
             ev.record(s)
         return ev
 
-    def local_tasks(self, copy_tasks: Sequence[CopyTask],
-                    layer: int) -> List[Tuple[int, int, int]]:
-        """Pick out the pulls this rank owns from the global task list.
+    def local_tasks(self, copy_tasks: Sequence[CopyTask], slots_per_layer: int
+                    ) -> List[Tuple[int, int, int]]:
+        """Pulls this rank owns, every layer -> [(dst_slot, src_rank, src_slot)].
+
+        copy_tasks       [(layer, src_rank, src_slot, dst_rank, dst_slot, expert)]
+                         with both slots layer-local
+        slots_per_layer  stride that folds the layer into a pool slot id, so the
+                         result addresses the whole pool and layers cannot collide
 
         The planner never emits src_rank == dst_rank: a rank holding e in a base
         slot is excluded as a replica target, so every task is a real peer copy.
         """
         out = []
         for l, src_rank, src_slot, dst_rank, dst_slot, _ in copy_tasks:
-            if l != layer or dst_rank != self.rank:
+            if dst_rank != self.rank:
                 continue
             assert src_rank != dst_rank, f"self-copy in task {(l, src_rank, dst_rank)}"
-            out.append((dst_slot, src_rank, src_slot))
+            off = l * slots_per_layer
+            out.append((off + dst_slot, src_rank, off + src_slot))
         return out
 
     def commit(self, log2phy: torch.Tensor, new_log2phy: torch.Tensor,
                logcnt: torch.Tensor, new_logcnt: torch.Tensor,
                stream: Optional[torch.cuda.Stream] = None) -> None:
+        """Overwrite the routing table in place, keeping its addresses.
+
+        log2phy / new_log2phy  [L, E, C]
+        logcnt / new_logcnt    [L, E]
+
+        Defaults to the current stream, which must be the one replay() uses:
+        ordering against in-flight replays is what makes a mid-decode table
+        swap safe, and a separate stream would drop that guarantee.
+        """
         s = stream or torch.cuda.current_stream()
         _C.commit_routing_table(log2phy, new_log2phy, logcnt, new_logcnt,
                                 s.cuda_stream)

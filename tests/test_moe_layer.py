@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from live_eplb.moe_layer import GraphSafeMoEShard, GATE, UP, DOWN
+from live_eplb.moe_layer import GraphSafeMoEShard, MoEStack, GATE, UP, DOWN
 
 E, SLOTS, H, M, BASE = 32, 12, 128, 64, 8      # small but structurally identical
 RED = SLOTS - BASE
@@ -244,6 +244,66 @@ def test_reallocation_is_detected():
     except AssertionError:
         return
     raise AssertionError("reallocation went undetected")
+
+
+L = 3
+
+
+def make_stack(seed=0):
+    """-> (stack, x [T, H], expert [L, T]); every layer holds experts 0..BASE
+    in its base slots, with per-layer weights so a cross-layer mix shows up."""
+    torch.manual_seed(seed)
+    st = MoEStack(L, E, SLOTS, H, M, max_replicas=4)
+    l2p = torch.full((L, E, 4), -1, dtype=torch.int32)
+    cnt = torch.zeros(L, E, dtype=torch.int32)
+    l2p[:, :BASE, 0] = torch.arange(BASE, dtype=torch.int32)
+    cnt[:, :BASE] = 1
+    st.load_routing(l2p.cuda(), cnt.cuda())
+    for s in range(L * SLOTS):
+        st.load_expert(s, rand_w())
+    x = torch.randn(T, H, device="cuda", dtype=torch.bfloat16)
+    expert = torch.stack([(torch.arange(T, device="cuda") + l) % BASE
+                          for l in range(L)]).to(torch.int32)
+    return st, x, expert
+
+
+def test_stack_graph_matches_eager():
+    st, x, e = make_stack()
+    eager = st.forward(x, e).clone()
+    st.capture(x, e)
+    y = st.replay()
+    torch.cuda.synchronize()
+    assert torch.allclose(y.float(), eager.float(), atol=5e-2)
+
+
+def test_stack_layer_reads_its_own_pool_range():
+    """Layer l's slot id must resolve inside [l*SLOTS, (l+1)*SLOTS), so the same
+    layer-local id in two layers picks different weights."""
+    st, x, e = make_stack()
+    for l in range(L):
+        assert st.layers[l].w_pool.data_ptr() == (
+            st.w_pool.data_ptr() + l * SLOTS * st.w_pool[0].nbytes)
+    # one token, routed to the same layer-local slot in every layer
+    xs = x[:1]
+    es = torch.zeros(L, 1, device="cuda", dtype=torch.int32)
+    y = st.forward(xs, es)
+    want = xs[0]
+    for l in range(L):
+        want = ref(want, st.w_pool[l * SLOTS])
+    torch.cuda.synchronize()
+    assert torch.allclose(y[0].float(), want.float(), atol=5e-2)
+
+
+def test_stack_commit_to_one_layer_leaves_others():
+    """The per-layer tables are views, so an in-place edit on layer 0 must be
+    visible to layer 0's shard and to nothing else."""
+    st, x, e = make_stack()
+    st.capture(x, e)
+    tgt = int(e[0, 0])
+    st.log2phy[0, tgt, 0] = BASE
+    st.assert_addresses_pinned()
+    assert int(st.layers[0].log2phy[tgt, 0]) == BASE
+    assert int(st.layers[1].log2phy[tgt, 0]) == tgt
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 """Stage 1: Pinned-Base incremental redundant-slot planner vs official EPLB."""
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -20,21 +20,34 @@ def static_phy2log(num_layers: int, num_ranks: int = 8, experts_per_rank: int = 
 
 def log2phy_from_phy2log(phy2log: torch.Tensor, num_experts: int
                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """phy2log [L, S] -> (phy2log, log2phy [L, E, C] int32, logcnt [L, E])."""
+    """phy2log [L, S] -> (phy2log, log2phy [L, E, C] int32, logcnt [L, E]).
+
+    Replica k of expert e is the k-th slot holding it, in slot order.
+    """
     num_layers, num_slots = phy2log.shape
     valid = phy2log >= 0
+    e = phy2log.clamp(min=0)
     logcnt = torch.zeros(num_layers, num_experts, dtype=torch.int64)
-    logcnt.scatter_add_(-1, phy2log.clamp(min=0), valid.to(torch.int64))
+    logcnt.scatter_add_(-1, e, valid.to(torch.int64))
     maxcnt = max(int(logcnt.max()), 1)
-    log2phy = torch.full((num_layers, num_experts, maxcnt), -1, dtype=torch.int32)
-    for l in range(num_layers):
-        cursor = [0] * num_experts
-        for s in range(num_slots):
-            e = int(phy2log[l, s])
-            if e < 0:
-                continue
-            log2phy[l, e, cursor[e]] = s
-            cursor[e] += 1
+
+    # Group the slots by expert, keeping slot order inside a group; a group
+    # starts where the experts before it end, so a slot's position minus that
+    # start is its replica index.
+    key = torch.where(valid, e, torch.full_like(e, num_experts))
+    order = torch.argsort(key, dim=1, stable=True)                      # [L, S]
+    grouped = key.gather(1, order)
+    starts = logcnt.cumsum(-1) - logcnt                                 # [L, E]
+    pos = torch.arange(num_slots).expand(num_layers, -1)
+    k = pos - starts.gather(1, grouped.clamp(max=num_experts - 1))      # [L, S]
+
+    # one trash column per expert absorbs the empty slots, then gets sliced off
+    width = maxcnt + 1
+    out = torch.full((num_layers, num_experts * width), -1, dtype=torch.int32)
+    dst = torch.where(grouped < num_experts, grouped * width + k,
+                      torch.full_like(k, num_experts * width - 1))
+    out.scatter_(1, dst, order.int())
+    log2phy = out.view(num_layers, num_experts, width)[..., :maxcnt].contiguous()
     return phy2log, log2phy, logcnt
 
 
@@ -104,28 +117,30 @@ def _diff_tasks(phy2log: torch.Tensor, prev: Optional[torch.Tensor], num_ranks: 
     scanned; the source is a constant, e's base replica at rank e//epr slot e%epr.
     dst_slot is rank-local, in [epr, epr+red)."""
     spr = epr + red
-    tasks: List[CopyTask] = []
-    for l in range(phy2log.shape[0]):
-        for r in range(num_ranks):
-            for i in range(red):
-                e = int(phy2log[l, r * spr + epr + i])
-                if e < 0:
-                    continue
-                if prev is not None and int(prev[l, r * spr + epr + i]) == e:
-                    continue
-                tasks.append((l, e // epr, e % epr, r, epr + i, e))
-    return tasks
+    num_layers = phy2log.shape[0]
+    cur = phy2log.view(num_layers, num_ranks, spr)[..., epr:]       # [L, R, red]
+    hit = cur >= 0
+    if prev is not None:
+        hit = hit & (cur != prev.view(num_layers, num_ranks, spr)[..., epr:])
+    lri = hit.nonzero()                                             # [N, 3], row-major
+    e = cur[hit]
+    return list(zip(lri[:, 0].tolist(), (e // epr).tolist(), (e % epr).tolist(),
+                    lri[:, 1].tolist(), (lri[:, 2] + epr).tolist(), e.tolist()))
 
 
 def plan_incremental_redundant(weight: torch.Tensor, num_ranks: int = 8,
                                experts_per_rank: int = 32, redundant_per_rank: int = 4,
-                               prev_phy2log: Optional[torch.Tensor] = None
+                               prev_phy2log: Optional[torch.Tensor] = None,
+                               layers: Optional[Sequence[int]] = None
                                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[CopyTask]]:
     """Pinned-Base planner. Base slots are frozen (rank r keeps [r*epr, (r+1)*epr)),
     so only the trailing redundant slots are planned and an expert gets at most
     num_ranks replicas. Layers are independent.
 
     weight [L, E] -> phy2log [L, S], log2phy [L, E, C], logcnt [L, E], copy tasks.
+
+    layers  which ones to re-plan; the rest keep prev_phy2log. A re-planned
+            layer is also kept only if it beats the one it replaces.
     """
     weight = weight.float().cpu()
     num_layers, num_experts = weight.shape
@@ -133,11 +148,22 @@ def plan_incremental_redundant(weight: torch.Tensor, num_ranks: int = 8,
         f"num_experts {num_experts} != num_ranks*experts_per_rank {num_ranks * experts_per_rank}")
     assert (weight >= 0).all(), "expert load must be non-negative"
 
-    phy2log = static_phy2log(num_layers, num_ranks, experts_per_rank, redundant_per_rank)
-    for l in range(num_layers):
+    phy2log = (static_phy2log(num_layers, num_ranks, experts_per_rank, redundant_per_rank)
+               if prev_phy2log is None else prev_phy2log.clone())
+    for l in range(num_layers) if layers is None else layers:
         row = _plan_layer(weight[l].numpy().astype(np.float64), num_ranks,
                           experts_per_rank, redundant_per_rank)
         phy2log[l] = torch.tensor(row, dtype=torch.int64)
+
+    if prev_phy2log is not None:
+        # Never hand back a layer worse than the one given. The greedy is not
+        # stable, so re-planning on drifted statistics can land on a placement
+        # that is no better and still costs a migration. Both are scored on the
+        # same weights, so comparing the peak rank load is enough.
+        old = rank_load(prev_phy2log, weight, num_ranks).max(-1).values
+        new = rank_load(phy2log, weight, num_ranks).max(-1).values
+        keep = new >= old                                     # ties keep prev
+        phy2log[keep] = prev_phy2log[keep]
 
     tasks = _diff_tasks(phy2log, prev_phy2log, num_ranks, experts_per_rank, redundant_per_rank)
     phy2log, log2phy, logcnt = log2phy_from_phy2log(phy2log, num_experts)

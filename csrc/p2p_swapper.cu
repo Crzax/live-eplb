@@ -116,9 +116,11 @@ bool enable_peer_access(int peer_rank) {
   CHECK(cudaDeviceCanAccessPeer(&can, dev, peer_rank));
   if (!can) return false;
   cudaError_t e = cudaDeviceEnablePeerAccess(peer_rank, 0);
-  if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
+  // Any failure leaves a sticky error that would surface in unrelated calls, so
+  // clear it here. Already-enabled is not a failure.
+  if (e != cudaSuccess) {
     cudaGetLastError();
-    return false;
+    return e == cudaErrorPeerAccessAlreadyEnabled;
   }
   return true;
 }

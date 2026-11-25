@@ -108,6 +108,40 @@ def test_diff_mode_after_drift():
     assert 0 < len(tasks) <= R * RED * 4
 
 
+def test_layers_restricts_what_is_replanned():
+    """Only the named layers may change; the rest keep prev_phy2log exactly,
+    so a balanced layer cannot churn just because another one went hot."""
+    w1, w2 = skewed(4, seed=1), skewed(4, seed=2)
+    prev, _, _, _ = plan_incremental_redundant(w1)
+    phy2log, _, _, tasks = plan_incremental_redundant(w2, prev_phy2log=prev, layers=[1])
+    assert torch.equal(phy2log[[0, 2, 3]], prev[[0, 2, 3]]), "untouched layer moved"
+    assert {t[0] for t in tasks} <= {1}, tasks
+    full, _, _, _ = plan_incremental_redundant(w2, prev_phy2log=prev)
+    assert torch.equal(phy2log[1], full[1]), "layer 1 differs from a full re-plan"
+
+
+def test_replan_never_regresses_a_layer():
+    """Re-planning on drifted statistics must not hand back a layer whose peak
+    rank load got worse; the greedy is free to land there, we just refuse it."""
+    w1 = skewed(6, seed=1)
+    prev, _, _, _ = plan_incremental_redundant(w1)
+    w2 = w1 * (1 + 0.05 * torch.randn(w1.shape,
+                                      generator=torch.Generator().manual_seed(3))).clamp(min=0.1)
+    phy2log, _, _, _ = plan_incremental_redundant(w2, prev_phy2log=prev)
+    before = rank_load(prev, w2).max(-1).values
+    after = rank_load(phy2log, w2).max(-1).values
+    assert (after <= before + 1e-6).all(), (before, after)
+    unchanged = (phy2log == prev).all(-1)
+    assert unchanged.any(), "test is vacuous: every layer improved"
+
+
+def test_layers_empty_is_a_no_op():
+    prev, _, _, _ = plan_incremental_redundant(skewed(4, seed=1))
+    phy2log, _, _, tasks = plan_incremental_redundant(
+        skewed(4, seed=2), prev_phy2log=prev, layers=[])
+    assert torch.equal(phy2log, prev) and tasks == []
+
+
 def test_uniform_weight_no_replica():
     """Replication cannot help uniform load, so nothing should move."""
     w = torch.ones(3, E)

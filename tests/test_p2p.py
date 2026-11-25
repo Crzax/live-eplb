@@ -95,10 +95,13 @@ def test_commit_rejects_bad_dtype(sw, pool, rank, world):
     raise AssertionError("int64 table should be rejected")
 
 
-def test_local_tasks_filters_by_rank(sw, pool, rank, world):
-    tasks = [(0, 1, 1, 0, 8, 33), (0, 0, 2, 1, 8, 2), (1, 1, 3, 0, 9, 35)]
-    mine = sw.local_tasks(tasks, layer=0)
-    expect = [(8, 1, 1)] if rank == 0 else ([(8, 0, 2)] if rank == 1 else [])
+def test_local_tasks_folds_the_layer_into_the_slot(sw, pool, rank, world):
+    """Same layer-local dst slot in two layers must come back as two different
+    pool slots, or one layer's pull would overwrite the other's."""
+    tasks = [(0, 1, 1, 0, 8, 33), (0, 0, 2, 1, 8, 2), (1, 1, 3, 0, 8, 35)]
+    mine = sw.local_tasks(tasks, SLOTS)
+    expect = ([(8, 1, 1), (SLOTS + 8, 1, SLOTS + 3)] if rank == 0
+              else [(8, 0, 2)] if rank == 1 else [])
     assert mine == expect, (rank, mine)
 
 
@@ -106,7 +109,7 @@ def test_local_tasks_rejects_self_copy(sw, pool, rank, world):
     """The planner cannot emit src_rank == dst_rank; assert we would notice."""
     bad = [(0, rank, 1, rank, 8, 1)]
     try:
-        sw.local_tasks(bad, layer=0)
+        sw.local_tasks(bad, SLOTS)
     except AssertionError:
         return
     raise AssertionError("self-copy went undetected")

@@ -72,8 +72,24 @@ the table — the graph never notices.
 - **Deterministic planning** — identical statistics produce an identical plan, so all 8 ranks can
   plan independently and skip broadcasting the placement; only the load statistics need an
   all-reduce.
+- **The trigger is per layer, and so is the re-plan** — each layer's redundant slots are its own, so
+  40 layers are 40 independent subproblems. Gating on the stack-average imbalance hides a layer that
+  is badly skewed behind 39 that are fine: measured, 11 skewed layers out of 40 cost 32% of step
+  time while the average reads 1.32, below the 1.35 threshold. The controller selects the layers
+  above threshold and the planner re-plans only those, keeping the rest byte-identical.
+- **A re-plan may never make a layer worse** — the greedy is optimal for one layer in isolation but
+  not monotone against the previous placement, so each layer's new peak rank load is compared with
+  the old one on the same statistics and the old one is kept on a tie. In a full re-plan this
+  rejects 164 copies that were pure regression.
 - **No atomics in the commit kernel** — kernels on one stream are ordered, so "replay sees a
   complete table" follows from stream ordering plus event sync. Atomics would only cost speed.
+- **Statistics are reduced off the GPU, on a fixed step cadence** — the payload is 1 KB, but an
+  NCCL collective spins on the GPU until the slowest rank joins and steals SMs from the decode
+  step; and a reduction gated by each rank's own state machine can deadlock. A gloo group inside
+  a background thread removes both.
+- **A redundant slot is unlinked from the routing table before it is overwritten** — "an unused
+  slot receives no tokens" only holds for the *first* migration. From the second one on, the
+  target slot is serving the previous plan's replica.
 
 ## Modules
 
@@ -83,15 +99,17 @@ the table — the graph never notices.
 | `live_eplb/eplb_official.py` | DeepSeek EPLB, vendored verbatim, used only as the comparison baseline |
 | `tutorials/01_eplb_diff.py` | Official full reshuffle vs bounded incremental planning |
 | `tutorials/01b_ablation.py` | Skew sweep, and the same-budget constraint-vs-algorithm ablation |
-| `tests/test_planner.py` | 14 invariant tests for the planner |
+| `tests/test_planner.py` | 17 invariant tests for the planner |
 | `live_eplb/moe_layer.py` | MoE shard with address-pinned `W_pool` / `log2phy`, graph capture, async staging |
 | `tutorials/02_cudagraph_swap.py` | In-place weight swap under a live graph, plus commit-vs-recapture timing |
-| `tests/test_moe_layer.py` | 14 tests for graph validity across swaps |
+| `tests/test_moe_layer.py` | 17 tests for graph validity across swaps |
 | `csrc/p2p_swapper.cu` | CUDA IPC handles, `cudaMemcpyPeerAsync`, single-launch routing commit |
 | `live_eplb/p2p.py` | Handle exchange, coalesced peer pulls, task filtering per rank |
 | `tutorials/03_p2p_bandwidth.py` | Cross-process correctness, NVLink bandwidth, HBM interference |
 | `tests/test_p2p.py` | 11 multi-process tests |
-| `live_eplb/controller.py` | *(stage 4)* async state machine, IDLE -> COPYING -> COMMIT |
+| `live_eplb/controller.py` | Async state machine: IDLE -> PLANNING -> COPYING -> commit, all off the critical path |
+| `benchmarks/run_synthetic_8gpu.py` | 8x H20 TPOT benchmark, three policies under a traffic shift |
+| `tests/test_controller.py` | 11 state-machine tests, single GPU |
 
 ## Installation
 
@@ -184,6 +202,61 @@ torchrun --nproc_per_node=4 tests/test_p2p.py
    total extra latency         : 0.39 ms
 ```
 
+Stage 4 is the end-to-end result: **40 MoE layers**, 300 decode steps on 8x H20, hot-expert set
+rotated at step 80. Every layer gets its own hot set, so every layer is planned independently.
+
+```bash
+torchrun --nproc_per_node=8 benchmarks/run_synthetic_8gpu.py --layers 40
+python benchmarks/plot_stage4.py 80
+```
+
+![TPOT under a traffic shift](results/synthetic_tpot_timeline.png)
+
+```
+policy      TPOT p50      p99    worst  Max/Mean last100  commits
+-----------------------------------------------------------------
+static        64.792   65.735   65.944             2.204        0
+stw           64.616  121.822  138.711             1.174       15
+live          64.581   65.904   66.143             1.166       12
+```
+
+All three policies share the same trigger, the same planner and the same copy tasks — only the
+way a new placement is *applied* differs.
+
+**LiveEPLB's worst step is within jitter of not rebalancing at all** — 66.143 ms vs static's
+65.944, i.e. +0.199 ms, and that worst step was a *cooldown* step where the controller spent
+0.07 ms, so the difference is not attributable to rebalancing. Stop-the-world's worst step is 110%
+above. Over the 15 stalls, the stop-the-world cost is almost entirely graph re-capture:
+
+```
+   step  slots    plan   drain    copy   recap    TPOT  vs p50
+     10    125    34.3    29.4     2.7    71.9   138.7   +73.9
+     90    138    38.0    26.3     3.0    51.4   119.1   +54.3
+    251      1     2.1    62.0     0.3    49.3   114.2   +49.4
+
+sum(copy + recap)  811.6 ms      <- the whole stall
+sum(TPOT - p50)    812.0 ms         re-capture is 98.6% of it
+```
+
+`plan + drain` is a constant ~64 ms on every row, which is one decode step: planning hides behind
+the replay that step launched anyway, so it is free. What is left is re-capture. **Step 251
+migrated a single expert and still paid 49.3 ms** — the stall barely depends on how much moved,
+which is exactly what LiveEPLB sidesteps: it does not make re-capture faster, it makes it not
+happen.
+
+The trade is not free. Steady-state balance is the same (2.204 → 1.17 for both, a 47% cut in peak
+rank load), but **for ~45 steps after the traffic shift LiveEPLB is measurably worse balanced than
+stop-the-world** — 2.089 vs 1.283 at the peak (step 100), because its first correction lands 11
+steps later and a per-layer re-plan needs several rounds to converge. It buys a flat tail and pays
+for it in recovery speed; which side wins depends on whether the SLO is written against latency or
+throughput, and this stage does not answer that.
+
+Note that "N times better" is highly sensitive to layer count: the same experiment at 1 layer gives
+38.7x (75.5 ms worst step vs 2.0 ms), because re-capture barely grows from 1 to 40 layers while a
+decode step grows 39x. The scale-independent claim is the first one. Full analysis — including why
+the per-layer trigger replaced a stack-average one, and four measurement bugs that each flattered
+this project — is in [`docs/stage4_experiments.md`](docs/stage4_experiments.md).
+
 ## The trade-off
 
 The planner is not strictly better than the official one — it occupies a different point:
@@ -219,7 +292,7 @@ latency budget.
 | 1 | Bounded incremental planner vs official EPLB | **done** |
 | 2 | Single-GPU CUDA Graph in-place swap, zero re-capture | **done** |
 | 3 | CUDA IPC + `cudaMemcpyPeerAsync` NVLink P2P engine | **done** |
-| 4 | Async state machine + 8x H20 TPOT benchmark | todo |
+| 4 | Async state machine + 8x H20 TPOT benchmark | **done** |
 | 5 | Real router traces from Qwen3.6-35B-A3B | todo |
 
 Target model: `Qwen/Qwen3.6-35B-A3B` — 40 MoE layers, 256 routed experts, top-8 routing,
@@ -236,6 +309,7 @@ live-eplb/
 │   ├── planner.py              <- Pinned-Base planner, peak-driven greedy
 │   ├── moe_layer.py            <- address-pinned MoE shard, graph capture, hot swap
 │   ├── p2p.py                  <- cross-process pulls over NVLink
+│   ├── controller.py           <- async state machine, background planning and staging
 │   ├── eplb_official.py        <- vendored DeepSeek EPLB (MIT), baseline only
 │   └── EPLB_LICENSE
 ├── tutorials/
@@ -243,17 +317,23 @@ live-eplb/
 │   ├── 01b_ablation.py         <- alpha sweep + equal-budget ablation
 │   ├── 02_cudagraph_swap.py    <- in-place swap under a live graph, timing
 │   └── 03_p2p_bandwidth.py     <- peer copy correctness, bandwidth, interference
+├── benchmarks/
+│   ├── run_synthetic_8gpu.py   <- 8x H20, three policies, 300 decode steps
+│   └── plot_stage4.py          <- writes results/synthetic_tpot_timeline.png
 ├── tests/
-│   ├── test_planner.py         <- 14 invariant tests
-│   ├── test_moe_layer.py       <- 14 graph-validity tests
-│   └── test_p2p.py             <- 11 multi-process tests
+│   ├── test_planner.py         <- 17 invariant tests
+│   ├── test_moe_layer.py       <- 17 graph-validity tests
+│   ├── test_p2p.py             <- 11 multi-process tests
+│   └── test_controller.py      <- 11 state-machine tests
 ├── docs/
 │   ├── stage1_experiments.md   <- workload model, all measurements, limitations
 │   ├── stage1_debug_notes.md   <- four real bugs and what caught each one
 │   ├── stage2_experiments.md   <- indirection design, the Python-int trap, timing
 │   ├── stage2_debug_notes.md   <- async timing trap, shared-cursor design bug
 │   ├── stage3_experiments.md   <- IPC, bandwidth vs coalescing, HBM contention
-│   └── stage3_debug_notes.md   <- parameter-semantics drift, a wrong hardware assumption
+│   ├── stage3_debug_notes.md   <- parameter-semantics drift, a wrong hardware assumption
+│   ├── stage4_experiments.md   <- the TPOT benchmark, what "zero downtime" costs
+│   └── stage4_debug_notes.md   <- fifteen bugs, four rounds of chasing the same spike
 ├── setup.py
 └── ROADMAP.md                  <- per-stage specs and known pitfalls
 ```
@@ -268,6 +348,8 @@ live-eplb/
 | [`docs/stage2_debug_notes.md`](docs/stage2_debug_notes.md) | Two more bugs: async timing measured as sync, and a shared cursor that made replication a no-op within a step |
 | [`docs/stage3_experiments.md`](docs/stage3_experiments.md) | CUDA IPC vs NCCL send/recv, why coalescing doubles bandwidth, how much a peer copy actually costs a decode step |
 | [`docs/stage3_debug_notes.md`](docs/stage3_debug_notes.md) | A parameter whose meaning drifted, and a hardware assumption ("copy engine does not touch SMs, therefore no interference") that measured 2.4x wrong |
+| [`docs/stage4_experiments.md`](docs/stage4_experiments.md) | The TPOT benchmark, why the baseline shares the trigger, where "zero downtime" actually lands, and one number left unexplained |
+| [`docs/stage4_debug_notes.md`](docs/stage4_debug_notes.md) | Fifteen bugs: four rounds of chasing the same spike (critical path, GIL, NCCL SM contention, thread startup), a routing race under repeated migration, a workload model that quietly cancelled its own result, a trigger that averaged away the thing it was gating, and three CPU-side stalls that TPOT could not see |
 | [`ROADMAP.md`](ROADMAP.md) | Technical spec for each stage, plus the pitfalls worth knowing before writing the code |
 
 ## Prior art
