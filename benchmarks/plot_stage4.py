@@ -9,7 +9,8 @@ import numpy as np
 SRC = "results/stage4_timeline.json"
 OUT = "results/synthetic_tpot_timeline.png"
 STYLE = {"static": ("#888888", "Static EP (no balancing)"),
-         "stw": ("#d62728", "Stop-The-World EPLB"),
+         "stw": ("#d62728", "Stop-The-World EPLB (re-capture)"),
+         "stw_inplace": ("#e4572e", "Stop-The-World, in-place commit"),
          "live": ("#1f77b4", "LiveEPLB")}
 
 
@@ -30,7 +31,6 @@ def main():
     ax1.set_yscale("log")
     ax1.legend(loc="upper right", fontsize=9)
     ax1.grid(alpha=0.3)
-    ax1.set_title("Expert rebalancing under a traffic shift, 8x H20")
 
     for p, (c, label) in STYLE.items():
         ax2.plot(d[p]["imbalance"], color=c, lw=1.1, label=label)
@@ -39,12 +39,15 @@ def main():
     ax2.set_ylabel("Max/Mean rank load")
     ax2.grid(alpha=0.3)
 
-    for p, mark, label in (("live", "commit", "LiveEPLB in-place commit"),
-                           ("stw", "recapture", "Stop-The-World re-capture")):
+    for p, mark, label in (("live", "commit", "LiveEPLB in-place commit (async)"),
+                           ("stw_inplace", "commit", "STW in-place commit (sync)"),
+                           ("stw", "recapture", "STW re-capture")):
         at = [i for i, a in enumerate(d[p]["actions"]) if a == mark]
         c = STYLE[p][0]
         ax2.plot(at, [d[p]["imbalance"][i] for i in at], "v", color=c, ms=7)
         ax2.plot([], [], "v", color=c, ms=7, label=label)
+    steps = len(d["static"]["tpot"])
+    ax1.set_title(f"Expert rebalancing under a traffic shift, 40 MoE layers, 8x H20, {steps} decode steps")
     ax2.legend(loc="upper right", fontsize=8, ncol=2)
 
     os.makedirs("results", exist_ok=True)
