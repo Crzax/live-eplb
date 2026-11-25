@@ -8,12 +8,20 @@ import numpy as np
 
 SRC = "results/stage4_timeline.json"
 OUT = "results/synthetic_tpot_timeline.png"
-STYLE = {"static": ("#888888", "Static EP (no balancing)"),
-         "stw": ("#d62728", "Stop-The-World EPLB (re-capture)"),
-         "stw_inplace": ("#e4572e", "Stop-The-World, in-place commit"),
-         "stw_official": ("#9467bd", "STW, official EPLB + staged reshuffle"),
-         "stw_official_inplace": ("#7a5fa8", "STW official, in-place commit"),
-         "live": ("#1f77b4", "LiveEPLB")}
+STYLE = {
+    "static":                ("#7f7f7f", "Static EP (no balancing)", "-"),
+    "stw":                   ("#d62728", "STW, our planner, re-capture", "-"),
+    "stw_inplace":           ("#ff7f0e", "STW, ours, in-place commit", "-"),
+    "stw_official":          ("#9467bd", "STW, official EPLB + recapture", "-"),
+    "stw_official_inplace":  ("#2ca02c", "STW, official EPLB + in-place", "-"),
+    "live":                  ("#1f77b4", "LiveEPLB", "-"),
+}
+
+
+def rolling(x, n=15):
+    x = np.asarray(x)
+    c = np.cumsum(np.insert(x, 0, 0.0))
+    return (c[n:] - c[:-n]) / n
 
 
 def main():
@@ -26,27 +34,29 @@ def main():
                                    gridspec_kw={"height_ratios": [2, 1]})
 
     base = np.median(np.array(d["static"]["tpot"]))
-    for p, (c, label) in STYLE.items():
+    for p, (c, label, _) in STYLE.items():
         if p not in d:
             continue
         t = np.array(d[p]["tpot"])
-        # log of the excess over the static median: absolute TPOT spans
-        # 64-440 ms, which sits on <1 decade of a log axis and hides 0.3 ms
-        # differences; the excess spreads them over 4 decades
         y = np.clip(t - base, 5e-3, None)
-        ax1.plot(y, color=c, lw=1.0,
-                 label=f"{label}  (worst +{t.max() - base:.2f} ms)")
-    ax1.axhline(0.05, color="k", lw=0.5, ls=":")
-    ax1.text(2, 0.055, "baseline = static p50", fontsize=8)
+        rm = rolling(y)
+        # scatter: per-step dots so zigzag 不连线; rolling median 15-step 鉴趋势
+        xs = np.arange(len(y))
+        ax1.scatter(xs, y, color=c, s=3, alpha=0.25, lw=0)
+        ax1.plot(np.arange(len(rm)) + 7, rm, color=c, lw=1.4,
+                 label=f"{label}  (worst +{t.max() - base:.1f} ms)")
+    ax1.axhline(0.0, color="k", lw=0.6, ls="--")
+    ax1.text(2, 0.03, "baseline = static p50", fontsize=8)
     ax1.axvline(shift_at, color="k", ls="--", lw=0.8)
     ax1.text(shift_at + 3, ax1.get_ylim()[1] * 0.85, "traffic shift", fontsize=9)
     ax1.set_yscale("log")
     ax1.set_ylabel("TPOT - static p50 (ms, log)")
-    ax1.legend(loc="upper right", fontsize=8)
+    ax1.legend(loc="upper right", fontsize=7)
     ax1.grid(alpha=0.3)
-    ax1.set_title("Expert rebalancing under a traffic shift, 8x H20, 300 decode steps")
+    ax1.set_title(f"Expert rebalancing under a traffic shift, 8x H20, "
+                  f"{len(d['static']['tpot'])} decode steps")
 
-    for p, (c, label) in STYLE.items():
+    for p, (c, label, _) in STYLE.items():
         if p not in d:
             continue
         ax2.plot(d[p]["imbalance"], color=c, lw=1.1, label=label)
@@ -67,7 +77,7 @@ def main():
         c = STYLE[p][0]
         ax2.plot(at, [d[p]["imbalance"][i] for i in at], "v", color=c, ms=7)
         ax2.plot([], [], "v", color=c, ms=7, label=label)
-    ax2.legend(loc="upper right", fontsize=7, ncol=2)
+    ax2.legend(loc="upper right", fontsize=6, ncol=2)
 
     os.makedirs("results", exist_ok=True)
     fig.tight_layout()

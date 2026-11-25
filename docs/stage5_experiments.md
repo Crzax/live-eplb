@@ -90,14 +90,14 @@ live                   66.599   67.349   67.466             1.223       12
 stw 停机分解典型行（ms）:  同 40 层合成的结论（recapture 主导，copy ≤ 3 ms）
 stw_official 完整账单:     plan ~220 / copy ~100 (双 barrier+staging) / recap ~50 → ~360-450 ms/次
 stw_official_inplace:      同上去掉 recap ≈ ~300-390 ms/次（"官方不重录"版——也省不掉大头）
-```
-static         1.665    1.759   1.761             2.218   0
-stw            1.599   34.218  43.394             1.216   5
-stw_inplace    1.597    2.086   2.282             1.216   5
-stw_official   1.660    2.301  62.492             1.106   3
-stw_official_inplace   1.660    1.803  30.090     1.106   3
-live           1.642    1.760   2.021             1.224   3
-live           1.730    1.832   2.024             1.274   6
+
+static                  1.665    1.759   1.761             2.218   0
+stw                     1.599   34.218  43.394             1.216   5
+stw_inplace             1.597    2.086   2.282             1.216   5
+stw_official            1.660    2.301  62.492             1.106   3
+stw_official_inplace    1.660    1.803  30.090     1.106   3
+live                    1.642    1.760   2.021             1.224   3
+live                    1.730    1.832   2.024             1.274   6
 ```
 
 ![real trace TPOT timeline](figures/trace_timeline_40layer.png)

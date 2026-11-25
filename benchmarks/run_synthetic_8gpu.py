@@ -54,6 +54,79 @@ def phase_probs(layers, alpha, shift):
                         for l in range(layers)])
 
 
+def official_walk(stack, sw, prev_p2l, phy, rank, scratch, L):
+    """Stage-free full reshuffle -> (my tasks, rounds used).
+
+    Task = "dst gid gets the OLD content of src gid", gid global pool id. Run:
+    a task is runnable when no pending task pulls its dst as source; run the
+    runnable set, barrier, repeat. On a pure cycle, the owner of the smallest
+    dst immediately pulls its OLD src into one scratch slot (its content is
+    then safe), pops the task, and dst<-scratch is deferred to the very end.
+    Deterministic: all ranks compute the same global map and break cycles in
+    the same order, so rounds stay in lockstep without a coordinator.
+    """
+    POOL = L * SLOTS
+    tasks = {}                      # dst gid -> (src rank, src gid)
+    for r in range(RANKS):
+        for l in range(L):
+            prev_row = prev_p2l[l].tolist()
+            new_row = phy[l].tolist()
+            first = {}
+            for g, e in enumerate(prev_row):
+                if e >= 0 and e not in first:
+                    first[e] = g
+            for g in range(r * SLOTS, (r + 1) * SLOTS):
+                e_new = new_row[g]
+                if e_new >= 0 and e_new != prev_row[g]:
+                    g2 = first[e_new]
+                    tasks[r * POOL + l * SLOTS + g % SLOTS] = (
+                        g2 // SLOTS, (g2 // SLOTS) * POOL
+                        + l * SLOTS + g2 % SLOTS)
+
+    pending = dict(tasks)
+    lends = []                      # (dst pool, scratch idx)
+    s = sw.stream
+    n_tasks = sum(1 for d in tasks if d // POOL == rank)
+    n_rounds = 0
+    while pending:
+        consumed = {t[1] for t in pending.values()} & set(pending)
+        ready = {d: t for d, t in pending.items() if d not in consumed}
+        if not ready:
+            d = min(pending)        # deterministic cycle pick
+            sr, sp = pending[d]
+            i = len(lends)
+            assert i < scratch.shape[0], "cycle scratch exhausted"
+            if d // POOL == rank:
+                with torch.cuda.stream(s):
+                    _C.async_copy_expert_slot(scratch, i, sr, sp % POOL,
+                                              sw.slot_bytes, s.cuda_stream)
+            s.synchronize()
+            dist.barrier()
+            lends.append((d // POOL, d % POOL, i))
+            pending.pop(d)
+            continue
+        mine = [(d % POOL, sr, sp % POOL) for d, (sr, sp) in ready.items()
+                if d // POOL == rank]
+        if mine:
+            with torch.cuda.stream(s):
+                for dp, sr, sp in mine:
+                    _C.async_copy_expert_slot(stack.w_pool, dp, sr, sp,
+                                              sw.slot_bytes, s.cuda_stream)
+        s.synchronize()
+        dist.barrier()
+        for d in ready:
+            pending.pop(d)
+        n_rounds += 1
+    if lends:
+        with torch.cuda.stream(s):
+            for owner, dp, i in lends:
+                if owner == rank:
+                    stack.w_pool[dp].copy_(scratch[i], non_blocking=True)
+        s.synchronize()
+        dist.barrier()
+    return n_tasks, n_rounds
+
+
 def build(rank, layers):
     """-> a MoEStack whose every layer holds experts [rank*EPR, (rank+1)*EPR)
     in its base slots, each slot tagged with its (layer, expert).
