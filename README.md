@@ -192,7 +192,6 @@ live-eplb/
 │   ├── figures/                <- logo & the two timeline + heatmap figures
 │   ├── stage{1..5}_experiments.md
 │   └── stage{1..5}_debug_notes.md   <- 27 bugs in total, most of them silent ones
-├── internal/                   <- working notes (TODO / now), not deliverables
 ├── setup.py
 ├── ROADMAP.md                  <- per-stage specs, pitfalls, honest estimates
 └── LICENSE
