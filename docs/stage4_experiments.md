@@ -41,8 +41,8 @@ Stage 1-3 分别解决了"搬多少"、"怎么换不重录"、"怎么跨进程�
 - `stw_inplace` — 停机式但持有路由表间接层：规划、同步等拷贝完成、**只 commit 路由表**，
   不重录。代表把 xLLM / SwiftBalancer 的切表技巧拿到手、但拒绝后台异步
 - `stw_official` — **DeepSeek 官方 EPLB 规划器 + 全量重排**（每次提交约改 1400/1440 槽），
-  先过**双 barrier staging**（这是全量重排必需的两阶段协议，我们的 planner 不需要它）
-  再重录。它是外面世界里"停机式 EPLB"的完整账单
+  用**循环链步 + 每 cycle 一个 6.29 MB scratch 的 cycle-walk**（不是 2x 池 staging）搬权，
+  再重录。这才是外面世界里"停机式 EPLB"的标准账单
 - `stw_official_inplace` — 同样的官方规划 + staging，提交时**只 commit 路由表不重录**。
   就是你那句"官方难道不能也不重录吗"——能，但省下的只是它的八分之一，
   大头在它的规划和换手
@@ -66,8 +66,8 @@ policy               TPOT p50      p99    worst  Max/Mean last100  commits
 static                 64.807   65.730   65.866             2.204        0
 stw                    64.609  133.634  151.912             1.174       15
 stw_inplace            64.618   67.057   69.045             1.174       15
-stw_official           65.787  391.494  533.297             1.112        6
-stw_official_inplace   65.804  305.823  406.839             1.112        6
+stw_official           65.790  398.150  473.055             1.119        6
+stw_official_inplace   65.794  309.452  385.873             1.119        6
 live                   64.512   65.887   65.995             1.189       12
 ```
 
