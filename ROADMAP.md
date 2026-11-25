@@ -165,8 +165,8 @@ Key findings:
   (`layer * spr + local`). Keeping the table layer-local is what lets the commit kernel, `_route`
   and `P2PSwapper` stay untouched from the single-layer version.
 - **The stop-the-world cost is graph re-capture, nothing else.** Over 15 stalls,
-  `sum(copy + re-capture)` is 771.4 ms against `sum(TPOT - p50)` of 770.9 ms, and re-capture is
-  98.1% of it. Planning is free because it overlaps the replay the step launched anyway. One stall
+  `sum(copy + re-capture)` is 961.6 ms against `sum(TPOT - p50)` of 961.3 ms, and re-capture is
+  ~96% of it. Planning is free because it overlaps the replay the step launched anyway. One stall
   migrated a **single** expert and still paid 52.7 ms. So the thing to attack is not the volume of
   the copy but the existence of the re-capture.
 - **A flat tail is paid for in recovery speed.** Steady-state balance matches stop-the-world, but
@@ -275,7 +275,7 @@ assumed a full redundant-slot refresh while the incremental planner only rewrite
 and the "~320 GB/s" back-calculation was derived from a copy timing that had the in-flight replay
 folded into it. The metric remains **TPOT jitter**, not total migration time: copying is 1.9% of a
 stop-the-world stall and planning is free (it overlaps the replay the step launched anyway), so
-**98.1% of the stall is graph re-capture**.
+**~96% of the stall is graph re-capture**.
 
 ## Deliverables
 
