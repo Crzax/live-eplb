@@ -1,25 +1,18 @@
-"""Collect real router decisions from Qwen3.6-35B-A3B on two prompt domains.
+"""Real router decisions of Qwen3.6-35B-A3B on two prompt domains.
 
-Phase A = code generation (English), phase B = math + Chinese encyclopedia.
-Hook every Qwen3_5MoeTopKRouter; its forward returns
-(router_logits, router_scores, router_indices); [2] is [tokens, 8] and is all
-we keep. Output counts [L=40, E=256] per phase -> results/router_traces.pt.
+Hook every Qwen3_5MoeTopKRouter (its forward returns
+(logits, scores, router_indices); [2] is [tokens, 8]) and bincount per layer
+-> counts [40, 256] per phase -> results/router_traces.pt.
+--prompts-dir loads results/prompts_<phase>.jsonl from download_prompts.py;
+without it the built-in 48 prompts are used.
 
---prompts-dir reads results/prompts_<phase>.jsonl written by download_prompts.py
-(large standard-dataset sets); omit it to use the 48 hand-written prompts.
-Batches by token count: sort by length, pack similar lengths, count only
-non-pad positions via the attention mask.
-
-Run on the GPU box:
-    python benchmarks/collect_router_trace.py --prompts-dir results --batch 6
+    python benchmarks/collect_router_trace.py --prompts-dir results --batch 8
 """
 import argparse, json, os, sys, time
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-MODEL = "MODEL_PATH"
+MODEL = os.environ.get("QWEN_MODEL", "Qwen/Qwen3.6-35B-A3B")
 
 PHASE_A = [
     "Write a Python function that finds the longest palindromic substring in a string.",

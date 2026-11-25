@@ -141,15 +141,10 @@ class LiveEPLBController:
         self.hold_c = self.host_c.clone().pin_memory()  # [L, E]
         self.live_l = shard.log2phy.cpu()               # [L, E, C] mirror, in force
         self.live_c = shard.logcnt.cpu()                # [L, E]
-        # a no-op commit, to load the kernel's module now: the first launch
-        # costs as much as a decode step in the driver, and the first real
-        # commit is on the decode stream
+        # 首启预热：commit kernel 的模块加载 / EMA 的 pageable H2D 第一次都会
+        # 先等掉一整个 decode step（S4-15），趁这会儿还没有 replay 在飞
         self.sw.commit(shard.log2phy, shard.log2phy.clone(),
                        shard.logcnt, shard.logcnt.clone())
-        # same for the statistics: the first record() is a pageable H2D for the
-        # EMA plus a module load, and either waits out whatever the decode
-        # stream is running. Zeros leave the EMA at zero, so this costs nothing
-        # but the warmup.
         self.record(torch.zeros(self.ema.shape, device=shard.log2phy.device))
         self.layer_imbalance()
         self.commits = 0

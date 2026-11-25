@@ -179,12 +179,8 @@ def run(policy, args, rank, world, stack, sw):
             act = ctrl.on_step(dev_counts)
         elif policy in ("stw", "stw_inplace") and step >= args.warmup \
                 and step - stw_last >= args.cooldown:
-            # same trigger and same plan as live; only the way it is applied
-            # differs, and all of it sits on the critical path. stw re-captures
-            # the graph as if the layout were baked into pointers; stw_inplace
-            # owns the same routing-table indirection but applies it
-            # synchronously, so its stall is plan + copy (+HBM contention) with
-            # no re-capture and no retraction
+            # 与 live 共享触发/规划/拷贝，只改"怎么应用"：stw 重录 graph，
+            # stw_inplace 同样原地切表但同步——全部压在关键路径上
             stats = ema * world
             load = rank_load(base_phy2log, stats, RANKS)
             per_layer = load.max(-1).values / load.mean(-1)
@@ -196,10 +192,8 @@ def run(policy, args, rank, world, stack, sw):
                 mine = sw.local_tasks(tasks, SLOTS)
                 b = time.perf_counter()
                 if mine:
-                    # drain the replay first: pull_batch waits on it anyway, and
-                    # charging that wait to the copy made planning look free.
-                    # for stw_inplace this drain also proves the copy cannot
-                    # race a read, so no table has to be retracted first
+                    # pull_batch 反正要等本步 replay 排完，先显式 drain 才能
+                    # 单量 copy；stw_inplace 靠它证明拷贝不会撞上读，无需摘除表
                     torch.cuda.synchronize()
                     c = time.perf_counter()
                     sw.pull_batch(mine).synchronize()

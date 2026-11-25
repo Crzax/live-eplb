@@ -1,24 +1,17 @@
-"""Build large, standard-dataset prompt sets for router-trace collection.
+"""Standard-dataset prompt sets -> results/prompts_<phase>.jsonl ({"text": ...}).
 
-Needs external access (HF hub) -> export the proxy first, e.g.
-    export https_proxy=http://PROXY_HOST:PORT
-    export http_proxy=...same...
-and unset it afterwards. Writes one JSON record per line:
-
-    results/prompts_phaseA_code.jsonl        {"text": ...}
-    results/prompts_phaseB_math_wiki.jsonl   {"text": ...}
+Requires external access to the HF hub.
 """
-import argparse, json, os, sys
+import argparse, json, os, random
+
+from datasets import load_dataset
 
 SOURCES = dict(
     phaseA_code=[
-        # competitive-programming problem statements, English, dense code domain
         ("deepmind/code_contests", "train", "description"),
     ],
     phaseB_math_wiki=[
-        # GSM8K translated to Chinese
         ("swulling/gsm8k_chinese", "train", "question_zh-cn"),
-        # Chinese elementary math competition problems (has no train split)
         ("weitianwen/cmath", "validation", "question"),
         ("weitianwen/cmath", "test", "question"),
     ],
@@ -26,18 +19,14 @@ SOURCES = dict(
 
 
 def take(name, split, field, limit, seed=1234):
-    from datasets import load_dataset
-    ds = load_dataset(name, split=split, streaming=True)
-    out, seen = [], 0
+    """-> list[str] of prompts, len >= 40 chars, deterministic shuffle."""
     buf = []
-    for row in ds:
+    for i, row in enumerate(load_dataset(name, split=split, streaming=True)):
         txt = (row.get(field) or "").strip().replace("\r", "")
-        if 40 <= len(txt):
+        if len(txt) >= 40:
             buf.append(txt)
-        seen += 1
-        if seen >= limit * 4 and len(buf) >= limit:
+        if i >= limit * 4 and len(buf) >= limit:
             break
-    import random
     random.Random(seed).shuffle(buf)
     return buf[:limit]
 

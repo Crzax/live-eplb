@@ -1,10 +1,8 @@
-"""Stage 1 replay on real router traces: bounded incremental plan vs the
-vendored official EPLB, weights = collected phase counts (scaled to 64
-routed tokens per layer per step, like the synthetic benchmark).
+"""Stage 1 replay on real traces: incremental plan vs vendored official EPLB,
+weights = phase counts normalized to TOKENS routed tokens per layer.
 
-Also writes results/qwen3_6_layer_skew_heatmap.png:
-per-layer Max/Mean under the static layout for phases A/B, and for phase B
-after LiveEPLB's incremental re-plan.
+Writes results/stage5_plan.json and results/qwen3_6_layer_skew_heatmap.png
+(per-layer Max/Mean: static on A, static on B, LiveEPLB-replanned on B).
 """
 import json, os, sys
 
