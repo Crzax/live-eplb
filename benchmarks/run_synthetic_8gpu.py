@@ -171,9 +171,14 @@ def run(policy, args, rank, world, stack, sw):
         act, t1 = "-", time.perf_counter()
         if policy == "live":
             act = ctrl.on_step(dev_counts)
-        elif policy == "stw" and step >= args.warmup and step - stw_last >= args.cooldown:
+        elif policy in ("stw", "stw_inplace") and step >= args.warmup \
+                and step - stw_last >= args.cooldown:
             # same trigger and same plan as live; only the way it is applied
-            # differs, and all of it sits on the critical path
+            # differs, and all of it sits on the critical path. stw re-captures
+            # the graph as if the layout were baked into pointers; stw_inplace
+            # owns the same routing-table indirection but applies it
+            # synchronously, so its stall is plan + copy (+HBM contention) with
+            # no re-capture and no retraction
             stats = ema * world
             load = rank_load(base_phy2log, stats, RANKS)
             per_layer = load.max(-1).values / load.mean(-1)
@@ -186,19 +191,24 @@ def run(policy, args, rank, world, stack, sw):
                 b = time.perf_counter()
                 if mine:
                     # drain the replay first: pull_batch waits on it anyway, and
-                    # charging that wait to the copy made planning look free
+                    # charging that wait to the copy made planning look free.
+                    # for stw_inplace this drain also proves the copy cannot
+                    # race a read, so no table has to be retracted first
                     torch.cuda.synchronize()
                     c = time.perf_counter()
                     sw.pull_batch(mine).synchronize()
                     d = time.perf_counter()
                     l, cn = rank_local_tables(l2p, rank, SLOTS, host_l, host_c)
-                    stack.load_routing(l.cuda(), cn.cuda())
-                    stack.capture(stack.static_x, stack.static_expert, warmup=0)
+                    if policy == "stw":
+                        stack.load_routing(l.cuda(), cn.cuda())
+                        stack.capture(stack.static_x, stack.static_expert, warmup=0)
+                    else:
+                        sw.commit(stack.log2phy, l.cuda(), stack.logcnt, cn.cuda())
                     torch.cuda.synchronize()
                     split.append((step, len(mine), (b - a) * 1e3, (c - b) * 1e3,
                                   (d - c) * 1e3, (time.perf_counter() - d) * 1e3))
                     stw_commits += 1
-                    act = "recapture"
+                    act = "recapture" if policy == "stw" else "commit"
                 base_phy2log, stw_last = p2l, step
 
         t2 = time.perf_counter()
@@ -241,7 +251,7 @@ def main():
     ap.add_argument("--cooldown", type=int, default=20)
     ap.add_argument("--check-every", type=int, default=8)
     ap.add_argument("--layers-per-step", type=int, default=4)
-    ap.add_argument("--policies", default="static,stw,live")
+    ap.add_argument("--policies", default="static,stw,stw_inplace,live")
     ap.add_argument("--out", default="results/stage4_timeline.json")
     args = ap.parse_args()
 

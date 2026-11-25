@@ -150,11 +150,14 @@ cross-check against `nvidia-smi topo -m`.
 `benchmarks/run_synthetic_8gpu.py`, `benchmarks/plot_stage4.py`,
 `tests/test_controller.py` (11/11). Runs the full 40 layers of the target model.
 
-Results: see `docs/stage4_experiments.md`. Headline — identical triggers and plans for all three
-policies; **LiveEPLB's worst step is within jitter of not rebalancing at all** (66.143 vs 65.944 ms,
-and that step was a cooldown step where the controller spent 0.07 ms) while stop-the-world's is
-110% above (138.7 ms). Max/Mean over the last 100 steps 2.204 (static) → 1.166 (live) →
-1.174 (stop-the-world) — but live stays worse than stop-the-world for ~45 steps after the shift.
+Results: see `docs/stage4_experiments.md`. Headline — identical triggers and plans for all four
+policies; **LiveEPLB's worst step is indistinguishable from not rebalancing at all** (66.166 vs
+static's 66.528 ms, i.e. 0.36 below) while stop-the-world's is 86% above (123.5 ms). A fourth
+policy, `stw_inplace`, applies the same plan synchronously but with the in-place commit instead
+of a re-capture: worst 69.03. So **the routing-table indirection accounts for 96% of the stall**
+(123.5 → 69.03) and **the async state machine for the remaining 2.9 ms**.
+Max/Mean over the last 100 steps 2.204 (static) → 1.166 (live) → 1.174 (both stop-the-world
+variants) — but live stays worse than stop-the-world for ~45 steps after the shift.
 
 Key findings:
 - **Three slot id spaces, and only one of them carries the layer.** The planner works in global
@@ -162,15 +165,15 @@ Key findings:
   (`layer * spr + local`). Keeping the table layer-local is what lets the commit kernel, `_route`
   and `P2PSwapper` stay untouched from the single-layer version.
 - **The stop-the-world cost is graph re-capture, nothing else.** Over 15 stalls,
-  `sum(copy + re-capture)` is 811.6 ms against `sum(TPOT - p50)` of 812.0 ms, and re-capture is
-  98.6% of it. Planning is free because it overlaps the replay the step launched anyway. One stall
-  migrated a **single** expert and still paid 49.3 ms. So the thing to attack is not the volume of
+  `sum(copy + re-capture)` is 771.4 ms against `sum(TPOT - p50)` of 770.9 ms, and re-capture is
+  98.1% of it. Planning is free because it overlaps the replay the step launched anyway. One stall
+  migrated a **single** expert and still paid 52.7 ms. So the thing to attack is not the volume of
   the copy but the existence of the re-capture.
 - **A flat tail is paid for in recovery speed.** Steady-state balance matches stop-the-world, but
   for ~45 steps after a traffic shift LiveEPLB is worse (2.089 vs 1.283 at the peak): its first
   correction lands 11 steps later, because its cooldown clock only restarts at commit, and a
   per-layer re-plan needs several rounds. This is a trade, not a free win.
-- **"N times better" is a function of layer count.** 38.7x at 1 layer, 2.1x at 40 — re-capture
+- **"N times better" is a function of layer count.** 18.1x at 1 layer, 1.9x at 40 — re-capture
   barely grows with depth while a decode step grows 39x. The scale-independent claim is the
   worst-step one.
 - **A per-layer judgement must not drive a whole-stack action.** Redundant slots are per layer, so
@@ -255,9 +258,9 @@ Migration volume, now measured rather than estimated: a Stage 4 commit at 40 lay
 earlier figures in this file were wrong: "< 2 ms" was optimistic, the "6.57 GB / ~19 ms" correction
 assumed a full redundant-slot refresh while the incremental planner only rewrites what changed,
 and the "~320 GB/s" back-calculation was derived from a copy timing that had the in-flight replay
-folded into it. The metric remains **TPOT jitter**, not total migration time: copying is 1.4% of a
+folded into it. The metric remains **TPOT jitter**, not total migration time: copying is 1.9% of a
 stop-the-world stall and planning is free (it overlaps the replay the step launched anyway), so
-**98.6% of the stall is graph re-capture**.
+**98.1% of the stall is graph re-capture**.
 
 ## Deliverables
 

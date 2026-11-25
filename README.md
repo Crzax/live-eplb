@@ -215,42 +215,60 @@ python benchmarks/plot_stage4.py 80
 ```
 policy      TPOT p50      p99    worst  Max/Mean last100  commits
 -----------------------------------------------------------------
-static        64.792   65.735   65.944             2.204        0
-stw           64.616  121.822  138.711             1.174       15
-live          64.581   65.904   66.143             1.166       12
+static        64.813   65.809   66.528             2.204        0
+stw           64.624  116.972  123.538             1.174       15
+stw_inplace   64.642   66.973   69.030             1.174       15
+live          64.572   66.019   66.166             1.166       12
 ```
 
-All three policies share the same trigger, the same planner and the same copy tasks — only the
-way a new placement is *applied* differs.
+`Max/Mean last100` averages the steady-state (last 100 steps) per-layer ratio
+**max rank load / mean rank load** — 1.0 would be perfect balance, 2.2 means one rank carries
+2.2 shares while seven carry ~1. `commits` counts placement installations.
 
-**LiveEPLB's worst step is within jitter of not rebalancing at all** — 66.143 ms vs static's
-65.944, i.e. +0.199 ms, and that worst step was a *cooldown* step where the controller spent
-0.07 ms, so the difference is not attributable to rebalancing. Stop-the-world's worst step is 110%
-above. Over the 15 stalls, the stop-the-world cost is almost entirely graph re-capture:
+All four policies share the same trigger, the same planner and the same copy tasks — only the
+way a new placement is *applied* differs. `stw` re-captures the CUDA Graph the way an engine
+without a routing-table indirection must; `stw_inplace` owns the same in-place commit as
+LiveEPLB but applies it synchronously, i.e. "this project minus the async state machine".
+
+**LiveEPLB's worst step is indistinguishable from not rebalancing at all** — 66.166 ms vs
+static's 66.528, i.e. 0.36 ms *below* it. Over the 15 application rounds, the stop-the-world
+cost is almost entirely graph re-capture:
 
 ```
    step  slots    plan   drain    copy   recap    TPOT  vs p50
-     10    125    34.3    29.4     2.7    71.9   138.7   +73.9
-     90    138    38.0    26.3     3.0    51.4   119.1   +54.3
-    251      1     2.1    62.0     0.3    49.3   114.2   +49.4
+     10    125    33.2    30.4     3.7    51.9   119.8   +55.0
+    251      1     2.0    62.1     0.3    52.7   117.5   +52.7
 
-sum(copy + recap)  811.6 ms      <- the whole stall
-sum(TPOT - p50)    812.0 ms         re-capture is 98.6% of it
+sum(copy + recap)  771 ms      <- the whole stall
+sum(TPOT - p50)    771 ms         re-capture is 98.1% of it
 ```
 
-`plan + drain` is a constant ~64 ms on every row, which is one decode step: planning hides behind
-the replay that step launched anyway, so it is free. What is left is re-capture. **Step 251
-migrated a single expert and still paid 49.3 ms** — the stall barely depends on how much moved,
-which is exactly what LiveEPLB sidesteps: it does not make re-capture faster, it makes it not
-happen.
+`plan + drain` is a constant ~64 ms on every row, which is one decode step: planning hides
+behind the replay that step launched anyway, so it is free. What is left is re-capture.
+**Step 251 migrated a single expert and still paid 52.7 ms** — and the copy itself is never
+the bottleneck (one expert is 6.29 MB; 1-138 slots land in 0.2-3.8 ms on NVLink).
 
-The trade is not free. Steady-state balance is the same (2.204 → 1.17 for both, a 47% cut in peak
-rank load), but **for ~45 steps after the traffic shift LiveEPLB is measurably worse balanced than
-stop-the-world** — 2.089 vs 1.283 at the peak (step 100), because its first correction lands 11
-steps later and a per-layer re-plan needs several rounds to converge. It buys a flat tail and pays
-for it in recovery speed; which side wins depends on whether the SLO is written against latency or
-throughput, and this stage does not answer that.
+Two consequences fall out of that table:
 
+1. **stw_inplace alone closes 96% of the stall** (worst 123.5 → 69.03). That is the honest
+   measure of how much of this project is "do not re-capture" — and it is what makes
+   LiveEPLB different from a plain EPLB integration. The remaining 2.9 ms over live comes
+   from plan overflow on the two large migrations, the copy still on the critical path, and
+   the commit still on the critical path — the three things the async state machine removes.
+2. **The trade is still not free.** Steady-state balance matches stop-the-world
+   (2.204 → 1.166, a 47% cut in peak rank load), but for ~45 steps after the traffic shift
+   LiveEPLB is measurably worse balanced than both stop-the-world variants — 2.089 vs 1.283
+   at the peak (step 100) — because its first correction lands ~11 steps later and a
+   per-layer re-plan needs several rounds to converge. It buys a flat tail and pays for it
+   in recovery speed; which side wins depends on whether the SLO is written against latency
+   or throughput, and this stage does not answer that.
+
+Note that "N times better" is highly sensitive to layer count: the same experiment at 1 layer
+gives 18.1x (36.7 ms worst step vs 2.0 ms), because re-capture barely grows from 1 to 40
+layers while a decode step grows 39x. The scale-independent claim is the first one. Full
+analysis — including why the per-layer trigger replaced a stack-average one, and four
+measurement bugs that each flattered this project — is in
+[`docs/stage4_experiments.md`](docs/stage4_experiments.md).
 Note that "N times better" is highly sensitive to layer count: the same experiment at 1 layer gives
 38.7x (75.5 ms worst step vs 2.0 ms), because re-capture barely grows from 1 to 40 layers while a
 decode step grows 39x. The scale-independent claim is the first one. Full analysis — including why
