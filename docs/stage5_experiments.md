@@ -43,7 +43,7 @@ phaseB_math_wiki:    608,408 次路由指派 / 1666 prompts，zero-count 专家 
    还有 197 个格子为零——**数学的路由天然比代码更集中**。
 3. **两域几乎不共享热点**：top-8 交集每层只有 1.38 个——域切换会真实地换一批专家。
 
-![per-layer skew heatmap](../results/qwen3_6_layer_skew_heatmap.png)
+![per-layer skew heatmap](figures/layer_skew_heatmap.png)
 
 ## Stage 1 重放：规划对比（大样本轨迹）
 
@@ -99,7 +99,7 @@ stw_inplace    1.724    2.145   2.690             1.286   7
 live           1.730    1.832   2.024             1.274   6
 ```
 
-![real trace TPOT timeline](../results/stage5_trace_timeline.png)
+![real trace TPOT timeline](figures/trace_timeline_40layer.png)
 
 ### 和合成结果逐条对照
 

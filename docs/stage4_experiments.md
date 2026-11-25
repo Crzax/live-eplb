@@ -122,7 +122,7 @@ stw_inplace    step  83   plan 1.5  drain 0.0  copy 0.5  recap  0.2   TPOT  2.4 
 
 单层下 step 只有 1.6 ms，replay 瞬间就排空了（drain ≈ 0），所以规划这次是真的暴露在
 关键路径上——但它只有 1.5 ms。stw 的 recapture 依然占停机的 **99.5%**。
-![TPOT timeline](../results/synthetic_tpot_timeline.png)
+![TPOT timeline](figures/timeline_40layer.png)
 
 > 这张图是 **40 层、300 步**那组实验。上栏是每步 TPOT（log 轴）：红尖刺 = stw 的 15 次
 > 图停机，橙色（stw_inplace）的每次停机只有 +1.5~4.2 ms，在这个尺度上根本看不出，蓝色的

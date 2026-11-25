@@ -23,3 +23,7 @@ TODO
 EPLB/
 *.egg-info/
 _probe_*.py
+
+# internal-only working files
+internal/测试方式
+internal/EPLB/

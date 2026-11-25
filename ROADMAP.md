@@ -279,7 +279,8 @@ stop-the-world stall and planning is free (it overlaps the replay the step launc
 
 ## Deliverables
 
-- `results/synthetic_tpot_timeline.png` (core plot)
-- `results/qwen3_6_layer_skew_heatmap.png`
+- `docs/figures/timeline_40layer.png` (core plot)
+- `docs/figures/layer_skew_heatmap.png`
+  (both copied from `results/`, which stays gitignored for raw output)
 - `README.md` — positioning, the TPOT plot, the numbers table, and an honest comparison with
   xLLM / SwiftBalancer stating which ideas are reproduced and which trade-off is ours.
