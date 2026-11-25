@@ -84,12 +84,13 @@ class P2PSwapper:
 
     def local_tasks(self, copy_tasks: Sequence[CopyTask], slots_per_layer: int
                     ) -> List[Tuple[int, int, int]]:
-        """Pulls this rank owns, every layer -> [(dst_slot, src_rank, src_slot)].
+        """Pulls this rank owns -> [(dst_slot, src_rank, src_slot)].
 
-        copy_tasks       [(layer, src_rank, src_slot, dst_rank, dst_slot, expert)]
-                         with both slots layer-local
-        slots_per_layer  stride that folds the layer into a pool slot id, so the
-                         result addresses the whole pool and layers cannot collide
+        copy_tasks       [(layer, src_rank, src_slot: L, dst_rank, dst_slot: L, expert)]
+                         with both slots layer-local (rank-lane slot ids)
+        slots_per_layer  spr, the stride that folds a layer-local slot into a
+                         pool slot id (global). Output ids are pool-wide and
+                         unique per (layer, slot) pair, so layers cannot collide
 
         The planner never emits src_rank == dst_rank: a rank holding e in a base
         slot is excluded as a replica target, so every task is a real peer copy.

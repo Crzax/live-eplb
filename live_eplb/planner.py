@@ -4,7 +4,13 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-CopyTask = Tuple[int, int, int, int, int, int]  # (layer, src_rank, src_slot, dst_rank, dst_slot, expert)
+# Slot ids live in three spaces, marked G (global) / L (layer-local) below:
+#  G  phy2log column: rank*spr + slot_in_rank, one space shared by all ranks
+#  L  log2phy value / copy-task slot / _diff_tasks src&dst: slot inside one
+#     rank on one layer, in [0, spr); routing tables ONLY store these
+#  pool P2PSwapper.local_tasks output: layer*spr + slot_in_rank, one space
+#     shared by every layer AND rank; the only id that can address the pool
+CopyTask = Tuple[int, int, int, int, int, int]  # (layer, src_rank, src_slot: L, dst_rank, dst_slot: L, expert)
 
 
 def static_phy2log(num_layers: int, num_ranks: int = 8, experts_per_rank: int = 32,

@@ -118,13 +118,15 @@ class LiveEPLBController:
         self.phy2log = static_phy2log(num_layers, num_ranks, experts_per_rank,
                                       redundant_per_rank)          # [L, S]
         self.planned_phy2log = self.phy2log      # [L, S] adopted at commit
-        # [L, 1, 1] layer-local slot id + this = pool slot id
+        # [L, 1, 1] L -> pool: hold_l/dst_slot + this (used only when moving
+        # between spaces; the table itself always stays in L)
         self.slot_offsets = (torch.arange(num_layers, dtype=torch.int32)
                              * (experts_per_rank + redundant_per_rank)).view(-1, 1, 1)
         self.state = State.IDLE
         self.step = 0
         self.last_commit = -cooldown_steps
-        # (dst_slot, src_rank, src_slot), all three pool ids
+        # (dst_slot, src_rank, src_slot), all three in pool ids (global);
+        # L only exists inside routing tables, never crosses function call
         self.pending: List[Tuple[int, int, int]] = []
         self.event: Optional[torch.cuda.Event] = None
         self.plan_result: Optional[tuple] = None
@@ -262,9 +264,9 @@ class LiveEPLBController:
         A redundant slot may still serve a replica an earlier plan put there,
         and overwriting it while routable hands tokens half-written weights.
 
-        The table is layer-local and `dst` is not, so the comparison is done in
-        pool ids. Padding (-1) biased by an offset can collide with a real slot
-        of the layer below, which the `l >= 0` term rules out.
+        The table is layer-local (L) and `dst` is pool ids (global), so the
+        comparison is done in pool ids. Padding (-1) biased by an offset can
+        collide with a real slot of the layer below, which `l >= 0` rules out.
         """
         l = self.live_l
         coded = l + self.slot_offsets
