@@ -245,17 +245,17 @@ This plot is the central piece of evidence. Report TPOT P50 / P99 / worst single
 real Qwen3.6-35B-A3B hooked for 48 prompts across two domains (code vs math/Chinese-wiki); the
 same four-policy benchmark re-run on the collected counts.
 
-Headline — **nothing from Stage 1-4 was an artifact of the synthetic load**:
+Headline — **nothing from Stage 1-4 was an artifact of the synthetic load** (4,066
+standard-dataset prompts, ~8M routed assignments):
 
-- Real traffic is milder (static Max/Mean 1.61-1.68, not 2.2) but layer-heterogeneous
-  (1.03 to 2.60); the two domains share only ~2/8 hot experts per layer, so the shift is real.
-- The trade-off is identical: LiveEPLB moves 6.04 GB vs the official reshuffle's 70.47 GB
-  (**11.7x**, the same factor as on Zipf) for 1.085 vs 1.001 balance; worst layer 1.330.
-- LiveEPLB's worst step is +0.24 ms over static's (in jitter); stw_inplace closes 96% of the
-  stall again (167.1 -> 70.5); live vs stw_inplace is 2.84 ms again (was 2.86).
-- LiveEPLB's convergence lag shrinks to ~37 steps with a peak gap of 0.20 (the synthetic
-  domain shift was extreme, 0.81): real domains move routing less, and per-layer incremental
-  planning is at its best when only some layers need fixing.
+- Real traffic is milder (static Max/Mean 1.53-1.64, not 2.2) but layer-heterogeneous
+  (1.09 to 2.63); the two domains share only ~1.4/8 hot experts per layer, so the shift is real.
+- The trade-off is identical: LiveEPLB moves 6.55 GB vs the official reshuffle's 70.5 GB
+  (**10.8x**) for 1.091 vs 1.000 balance; worst layer 1.263.
+- LiveEPLB's worst step is -0.13 ms over static's (in jitter); stw_inplace closes 96% of the
+  stall again (134.1 -> 70.8); live vs stw_inplace is ~3.1 ms again.
+- LiveEPLB's convergence lag is ~35 steps with a peak gap of 0.31; the synthetic domain shift
+  overshoots it at 0.81.
 
 Key findings:
 - **The per-layer gate finally met the input it was designed for.** Synthetic Zipf made every
@@ -264,8 +264,10 @@ Key findings:
   exactly those layers.
 - `transformers_version` in a config is the version that *wrote* the file, not the minimum
   version that can *run* it — the model class only exists in transformers 5.x (S5-3).
-- Prefill-only, 48-prompt traces are thin (see limitations in the experiments doc): they
-  resolve each layer's hot experts but not the tail. Enough to falsify "synthetic-only".
+- Small traces deceive in both directions at once: 48 prompts underestimated the math domain's
+  hottest layer (gap 0.20 -> 0.31 at scale) and overestimated planner quality (worst layer
+  1.330 -> 1.263 at scale). 4k standard-dataset prompts resolve all 10240 cells for code; the
+  shorter math prompts still leave 197 cells empty (see limitations, S5-4).
 Migration volume, now measured rather than estimated: a Stage 4 commit at 40 layers moves between
 **1 and 138 slots** (6 MB to 868 MB per rank) and the copy itself takes **0.1-3.0 ms**. Three
 earlier figures in this file were wrong: "< 2 ms" was optimistic, the "6.57 GB / ~19 ms" correction

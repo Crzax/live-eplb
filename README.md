@@ -275,17 +275,18 @@ decode step grows 39x. The scale-independent claim is the first one. Full analys
 the per-layer trigger replaced a stack-average one, and four measurement bugs that each flattered
 this project — is in [`docs/stage4_experiments.md`](docs/stage4_experiments.md).
 
-Then the same questions were re-asked on **real Qwen3.6 router traces** (48 prompts, code vs
-math/Chinese-wiki domains, hooks on all 40 MoE routers — Stage 5):
+Then the same questions were re-asked on **real Qwen3.6 router traces** — 4,066 standard-dataset
+prompts (`code_contests` vs Chinese GSM8K/C-Math, ~8M routed assignments, hooks on all 40 MoE
+routers — Stage 5):
 
-- Real traffic is milder but layer-heterogeneous: static Max/Mean 1.61-1.68 mean with single
-  layers from 1.03 to 2.60 — exactly the input the per-layer gate was designed for.
-- LiveEPLB still moves 11.7x less data than the official reshuffle (6.04 GB vs 70.47 GB) for
-  1.085 vs 1.001 balance.
-- LiveEPLB's worst step stays within jitter of static's (+0.24 ms); stw_inplace closes 96% of
-  the stop-the-world stall, live the remaining 2.84 ms; live's convergence lag shrinks to
-  ~37 steps with a peak balance gap of 0.20 (it was 45 steps / 0.81 on the synthetic shift,
-  which overshoots how far real domains move the routing).
+- Real traffic is milder but layer-heterogeneous: static Max/Mean 1.53-1.64 mean with single
+  layers from 1.09 to 2.63 — exactly the input the per-layer gate was designed for.
+- LiveEPLB still moves 10.8x less data than the official reshuffle (6.55 GB vs 70.5 GB) for
+  1.091 vs 1.000 balance, worst layer 1.263.
+- LiveEPLB's worst step stays within jitter of static's (-0.13 ms); stw_inplace closes 96% of
+  the stop-the-world stall, live the remaining ~3.1 ms; live's convergence lag is ~35 steps
+  with a peak balance gap of 0.31 (it was 45 steps / 0.81 on the synthetic shift, which
+  overshoots how far real domains move the routing).
 
 ## The trade-off
 

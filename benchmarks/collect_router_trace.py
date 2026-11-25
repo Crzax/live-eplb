@@ -5,10 +5,15 @@ Hook every Qwen3_5MoeTopKRouter; its forward returns
 (router_logits, router_scores, router_indices); [2] is [tokens, 8] and is all
 we keep. Output counts [L=40, E=256] per phase -> results/router_traces.pt.
 
+--prompts-dir reads results/prompts_<phase>.jsonl written by download_prompts.py
+(large standard-dataset sets); omit it to use the 48 hand-written prompts.
+Batches by token count: sort by length, pack similar lengths, count only
+non-pad positions via the attention mask.
+
 Run on the GPU box:
-    python benchmarks/collect_router_trace.py
+    python benchmarks/collect_router_trace.py --prompts-dir results --batch 6
 """
-import argparse, os, sys, time
+import argparse, json, os, sys, time
 
 import torch
 
@@ -76,6 +81,9 @@ def main():
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--out", default="results/router_traces.pt")
     ap.add_argument("--max-len", type=int, default=512)
+    ap.add_argument("--batch", type=int, default=1)
+    ap.add_argument("--prompts-dir")
+    ap.add_argument("--max-prompts", type=int, default=0)
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -101,25 +109,43 @@ def main():
         hooks.append(m.register_forward_hook(
             lambda _m, _i, o: picked.append(o[2].detach().to("cpu"))))
 
+    def load_prompts(phase, fallback):
+        if not args.prompts_dir:
+            return fallback
+        path = os.path.join(args.prompts_dir, f"prompts_{phase}.jsonl")
+        out = [json.loads(l)["text"] for l in open(path)]
+        if args.max_prompts:
+            out = out[:args.max_prompts]
+        return out
+
     dev = next(model.parameters()).device
     phases = {}
-    for name, prompts in (("phaseA_code", PHASE_A), ("phaseB_math_wiki", PHASE_B)):
+    for name, prompts in (("phaseA_code", load_prompts("phaseA_code", PHASE_A)),
+                          ("phaseB_math_wiki",
+                           load_prompts("phaseB_math_wiki", PHASE_B))):
+        # sort by length so a batch pads as little as possible
+        prompts = sorted(prompts, key=len)
         counts = None
         ntok = 0
-        for pi, p in enumerate(prompts):
+        n_batches = (len(prompts) + args.batch - 1) // args.batch
+        for bi in range(n_batches):
+            chunk = prompts[bi * args.batch:(bi + 1) * args.batch]
             picked.clear()
-            ids = tok(p, return_tensors="pt", truncation=True,
-                      max_length=args.max_len).input_ids.to(dev)
+            enc = tok(chunk, return_tensors="pt", padding=True, truncation=True,
+                      max_length=args.max_len).to(dev)
             with torch.no_grad():
-                model(input_ids=ids)
+                model(input_ids=enc.input_ids,
+                      attention_mask=enc.attention_mask)
             assert len(picked) == 40, len(picked)
-            c = torch.stack([torch.bincount(sel.flatten().long(),
-                                            minlength=256).float()
-                             for sel in picked])
+            keep = enc.attention_mask.flatten().bool().cpu()   # [B*T]
+            c = torch.stack([
+                torch.bincount(sel[keep].flatten().long(),
+                               minlength=256).float()
+                for sel in picked])
             counts = c if counts is None else counts + c
-            ntok += ids.numel() * 8
-            if pi % 8 == 0:
-                print(f"{name} {pi + 1}/{len(prompts)}", flush=True)
+            ntok += int(keep.sum()) * 8
+            if bi % 40 == 0:
+                print(f"{name} {bi + 1}/{n_batches} batches", flush=True)
         phases[name] = dict(counts=counts, prompts=prompts, routed_tokens=ntok)
         print(f"{name}: {ntok} routed assignments over {len(prompts)} prompts",
               flush=True)
