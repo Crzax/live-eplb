@@ -180,3 +180,36 @@ trace 66.3 vs 66.9）。且起病点很干净：step 0-9 和 static 一致，从
 大到却是系统性、可复现的**另一笔账**。**写进记录的原因不是它影响结论
 （它不影响：对照组更慢反而对我们有利），而是我花的三个对照实验告诉我——
 "能解释"和"测量过"是两回事，剩下那 0.55 ms 停止猜测，留给下次规模变化时再看。**
+
+---
+
+## S5-7 / S5-8：Cycle-walk 替换 staged 的实测反转
+
+### 症状与结局
+
+为了让 `stw_official` 这个对照不复用一块整 14 GB 的 staging buffer，把 staged 搬权
+换成了 cycle-walk：任务表按依赖就绪-set 排序，每轮 round barrier + stream 同步；
+cycle 用单槽 scratch 消解。校验通过后，显存降到 ~0.4 GB。
+
+但 40 层实测代价不小：
+
+```
+                    staged 版（默认）         walk 版
+40 层 copy（每提交）    83.6 ~ 246.2 ms         440.0 ~ 2371.4 ms
+40 层 worst             47 ~ 56 ms recap，共 341 ~ 533 ms    713 ~ 2652 ms
+真实轨迹 worst          446.1 ms                   1381.8 ms
+```
+
+walk 慢一个量级。根因不是显存：
+
+1. **barrier 每轮一份**：官方置换被平衡拆碎，形成几十~上百个小环，每轮 barrier 加 stream 同步，往返翻了好几倍。
+2. **丧失 coalesce**：staged 的 pull_batch 是大合并，约 376 GB/s；walk 被拆成小批量小拷贝，带宽掉一倍以上。
+3. **结论**：walk 不是 staged 的免费替代——它只在显存受限时才是选择。
+
+### 最终形态
+
+- **默认 = staged**（`STW_OFF_MODE` 未设时）——把 coalesce + 大拉集留给 staged。
+- **walk 可显存受限时开启**：`STW_OFF_MODE=walk`，一个 cycle 一个 scratch 槽、按需扩容。
+  它不是免费替代 staging。如果你的问题是显存而不是速度，它是正确选择；
+  否则默认保持 staged。
+

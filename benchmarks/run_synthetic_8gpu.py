@@ -94,12 +94,22 @@ def official_walk(stack, sw, prev_p2l, phy, rank, scratch, L):
         if not ready:
             d = min(pending)        # deterministic cycle pick
             sr, sp = pending[d]
-            i = len(lends)
-            assert i < scratch.shape[0], "cycle scratch exhausted"
+            # one scratch slot per broken cycle *owned by this rank*, grown on
+            # demand -- official reshuffles decompose into many short cycles
+            # (small-permutation artefacts of balanced packing), so a fixed
+            # budget is wrong. Still orders of magnitude below a 2nd pool.
+            i = sum(1 for o, _, _ in lends if o == rank)
+            if d // POOL == rank and i >= scratch.shape[0]:
+                scratch = torch.cat([scratch,
+                                     torch.empty_like(scratch)], dim=0)
             if d // POOL == rank:
                 with torch.cuda.stream(s):
-                    _C.async_copy_expert_slot(scratch, i, sr, sp % POOL,
-                                              sw.slot_bytes, s.cuda_stream)
+                    if sr == rank:
+                        scratch[i].copy_(stack.w_pool[sp % POOL],
+                                         non_blocking=True)
+                    else:
+                        _C.async_copy_expert_slot(scratch, i, sr, sp % POOL,
+                                                  sw.slot_bytes, s.cuda_stream)
             s.synchronize()
             dist.barrier()
             lends.append((d // POOL, d % POOL, i))
@@ -110,8 +120,13 @@ def official_walk(stack, sw, prev_p2l, phy, rank, scratch, L):
         if mine:
             with torch.cuda.stream(s):
                 for dp, sr, sp in mine:
-                    _C.async_copy_expert_slot(stack.w_pool, dp, sr, sp,
-                                              sw.slot_bytes, s.cuda_stream)
+                    if sr == rank:      # move within this rank is a plain D2D
+                        stack.w_pool[dp].copy_(stack.w_pool[sp],
+                                               non_blocking=True)
+                    else:
+                        _C.async_copy_expert_slot(stack.w_pool, dp, sr, sp,
+                                                  sw.slot_bytes,
+                                                  s.cuda_stream)
         s.synchronize()
         dist.barrier()
         for d in ready:
@@ -213,7 +228,17 @@ def run(policy, args, rank, world, stack, sw):
     base_phy2log = static_phy2log(L, RANKS, EPR, RED)
     official = policy.startswith("stw_official")
     off_p2l = base_phy2log.clone()      # placement in force for the official variants
-    staging = torch.empty_like(stack.w_pool) if official else None
+    if official:
+        # apply method: staged (default, pool-sized staging buffer but coalesced
+        # batched pulls) or walk (STW_OFF_MODE=walk; cycle-walk, memory-frugal but
+        # ~5-10x slower per commit; see docs/stage5_debug_notes S5-8)
+        mode = os.environ.get("STW_OFF_MODE", "staged")
+        staging = torch.empty_like(stack.w_pool) if mode == "staged" else None
+        scratch = (torch.empty(64, *stack.w_pool[0].shape,
+                              device=stack.w_pool.device, dtype=stack.w_pool.dtype)
+                   if mode == "walk" else None)
+    else:
+        staging = scratch = None
     if os.environ.get("ALLOC_BUF"):     # A/B probe for "extra pool allocation slows the replay"
         _buf = torch.empty_like(stack.w_pool)
     ema = torch.zeros(L, EXPERTS)
@@ -334,29 +359,30 @@ def run(policy, args, rank, world, stack, sw):
                                           l * SLOTS + g2 % SLOTS))
                 torch.cuda.synchronize()
                 c = time.perf_counter()
-                # a global reshuffle is a two-phase commit across the whole
-                # cluster: every rank stages its pulls first, and only then
-                # may anyone overwrite pool slots -- otherwise a pull can meet
-                # a concurrent overwrite of its source by the owner rank
-                dist.barrier()
-                s = sw.stream
-                s.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(s):
-                    for i, (_, sr, sp) in enumerate(tasks):
-                        if sr == rank:      # a reshuffle can also be a local move
-                            staging[i].copy_(stack.w_pool[sp],
-                                             non_blocking=True)
-                        else:
-                            _C.async_copy_expert_slot(staging, i, sr, sp,
-                                                      sw.slot_bytes,
-                                                      s.cuda_stream)
-                s.synchronize()     # my stage buffer is complete
-                dist.barrier()      # ... on every rank, so remote sources are
-                                    # no longer read by anyone
-                with torch.cuda.stream(s):
-                    for i, (dp, _, _) in enumerate(tasks):
-                        stack.w_pool[dp].copy_(staging[i], non_blocking=True)
-                torch.cuda.synchronize()
+                if mode == "staged":
+                    dist.barrier()
+                    s = sw.stream
+                    s.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(s):
+                        for i, (_, sr, sp) in enumerate(tasks):
+                            if sr == rank:
+                                staging[i].copy_(stack.w_pool[sp],
+                                                 non_blocking=True)
+                            else:
+                                _C.async_copy_expert_slot(staging, i, sr, sp,
+                                                          sw.slot_bytes,
+                                                          s.cuda_stream)
+                    s.synchronize()
+                    dist.barrier()
+                    with torch.cuda.stream(s):
+                        for i, (dp, _, _) in enumerate(tasks):
+                            stack.w_pool[dp].copy_(staging[i], non_blocking=True)
+                    torch.cuda.synchronize()
+                else:
+                    n_tasks, n_rounds = official_walk(stack, sw, off_p2l, phy,
+                                                      rank, scratch, L)
+                    tasks = [None] * n_tasks    # keep len(tasks) homogeneous
+                    torch.cuda.synchronize()
                 d = time.perf_counter()
                 l, cn = rank_local_tables(l2p, rank, SLOTS, host_l, host_c)
                 if policy == "stw_official":

@@ -40,10 +40,8 @@ Stage 1-3 分别解决了"搬多少"、"怎么换不重录"、"怎么跨进程�
   代表布局烧死在前向图里的引擎。规划器和 live 相同——**这一组只隔离"应用"的成本**
 - `stw_inplace` — 停机式但持有路由表间接层：规划、同步等拷贝完成、**只 commit 路由表**，
   不重录。代表把 xLLM / SwiftBalancer 的切表技巧拿到手、但拒绝后台异步
-- `stw_official` — **DeepSeek 官方 EPLB 规划器 + 全量重排**（每次提交约改 1400/1440 槽），
-  用**循环链步 + 每 cycle 一个 6.29 MB scratch 的 cycle-walk**（不是 2x 池 staging）搬权，
-  再重录。这才是外面世界里"停机式 EPLB"的标准账单
-- `stw_official_inplace` — 同样的官方规划 + staging，提交时**只 commit 路由表不重录**。
+- `stw_official` — **DeepSeek 官方 EPLB 规划器 + 全量重排**（每次提交约改 1400/1440 槽），搬权默认走**整车 staging**（占 ~14 GB 缓冲但 coalesce 搬得快）；`STW_OFF_MODE=walk` 是 cycle-walk（省显存但慢 5-10 倍），挑显存受限时开。再重录。
+- `stw_official_inplace` — 同样的官方规划 + staged 搬权，提交时**只 commit 路由表不重录**。
   就是你那句"官方难道不能也不重录吗"——能，但省下的只是它的八分之一，
   大头在它的规划和换手
 - `live` — 本项目：后台线程规划、`transfer_stream` 搬运、非阻塞轮询、原地切表
@@ -66,8 +64,8 @@ policy               TPOT p50      p99    worst  Max/Mean last100  commits
 static                 64.807   65.730   65.866             2.204        0
 stw                    64.609  133.634  151.912             1.174       15
 stw_inplace            64.618   67.057   69.045             1.174       15
-stw_official           65.790  398.150  473.055             1.119        6
-stw_official_inplace   65.794  309.452  385.873             1.119        6
+stw_official           65.788  394.154  533.296             1.112        6
+stw_official_inplace   65.804  311.111  406.839             1.112        6
 live                   64.512   65.887   65.995             1.189       12
 ```
 
@@ -123,26 +121,38 @@ stw_official_inplace  10   208.2    84.1     2.6   296.7   +230.9
                      283   226.9   175.6     2.6   406.8   +341.0
 ```
 
-stw_official，完整账单（每次提交约改 1400/1440 槽，双 barrier + staging）：
+stw_official（staged 版），完整账单（每次提交约改 1400/1440 槽）：
 
 ```
-   step  slots    plan   drain    copy   recap    TPOT  vs p50
-     10   1433   210.6     1.2    95.0    53.0   360.4  +294.6
-     81   1371   231.6     1.2   153.3    47.8   434.4  +368.7
-    127   1369   229.1     1.2   144.7    46.0   421.5  +355.7
+   step  slots    plan   drain    copy   recap    TPOT   vs p50
+     10   1433   208.9     1.2    83.6    47.1    341.4   +275.6
+    283   1376   229.0     1.2   246.2    56.4    533.3   +467.5
 ```
 
-三个事实一眼看到：
-1. **plan 208-229 ms**：官方 EPLB 的规划本身比我们贵一个量级（Stage 1 的 450 ms），
-   在 stw_official 里这段全程压在关键路径上。
-2. **copy 72-176 ms**：官方重排约一半槽换手、要 staging、要两次全集群 barrier，
-   不再是毫秒级。
-3. **recap 在官方那笔账里只值八分之一**：`stw_official_inplace` 341 → 297 ms，
-   省不掉真正的大头——**这是 Pinned-Base 用均衡上限还价的精确位置**。
-4. **平均每次停机 ~330-380 ms、均衡 1.112 vs live 1.166**：为这 5% 的均衡上限差，
-   付出的是一次停机三百毫秒以上 vs stw_inplace 的 ~2 ms。
+stw_official_inplace（staged 版），完整账单（重录换成原地切表后剩 ~2.6 ms）：
 
+```
+   step  slots    plan   drain    copy   recap    TPOT   vs p50
+     10   1433   208.2     1.2    84.1     2.6    296.7   +230.9
+    283   1376   226.9     1.3   175.6     2.6    406.8   +341.0
+```
 
+walk 版对照（`STW_OFF_MODE=walk`，显存到 ~0.4 GB，但慢 5-10 倍）：
+
+```
+policy                 step    plan     copy    recap    TPOT   vs p50
+stw_official            10   211.1    440.0    62.2    713.5   +647.7   walk
+stw_official           283   231.2   2362.5    57.2   2652.7  +2586.9   walk
+stw_official_inplace   283   233.1   2371.4     2.7   2608.9  +2543.1   walk
+```
+
+四个事实一眼看到：
+1. **plan 208-233 ms**：官方 EPLB 的规划本身比我们贵一个数量级（Stage 1 的 450 ms），全程压在关键路径上。
+2. **copy 84-246 ms**：官方重排约一半槽换手、要两端 barrier，不再是毫秒级。
+3. **recap 只占官方账单的八分之一**：重录 47-56 ms，省掉只是 ~50 ms；大头在规划和换手。
+4. **walk 只建议显存受限时开**：5-10 倍慢的根因是 barrier round 串行（官方置换被拆成几十~上百个小环）
+   + 丧失 pull_batch 的 376 GB/s coalesce。显存收益是 Pinned-Base 的设计红利，
+   不是 walk 的发明。
 ### 1 层（对照）
 
 ```

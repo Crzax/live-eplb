@@ -105,11 +105,12 @@ live                   64.512   65.887   65.995             1.189       12
   `stw_inplace` cancels outright. The remaining ~3 ms of LiveEPLB's edge is the async
   state machine removing planning, copying and the commit round-trip from the critical path.
 - The **official EPLB stop-the-world** pays the full external bill: plan ~220 ms plus a
-  cycle-walk reshuffle of ~1,400 slots (~75 ms over 2-4 rounds) plus re-capture (~55 ms) --
-  **a ~330 ms stall per commit**, ~5 decode steps, for Max/Mean 1.119 vs LiveEPLB's 1.166.
-  The whole migration needs **one 6.29 MB scratch slot**, not a 2x-pool staging buffer.
-  Giving it the in-place commit too saves only ~5%: the steepest cost of a global reshuffle
-  is the plan and the turnover, both of which Pinned-Base removes by construction.
+  reshuffle of ~1,400 slots (staging a pool-sized buffer by default so pulls coalesce;
+  a cycle-walk variant via `STW_OFF_MODE=walk` saves memory but costs 5-10x more time)
+  plus re-capture (~50 ms) -- **a ~330-530 ms stall per commit**, ~5-8 decode steps, for
+  Max/Mean 1.119 vs LiveEPLB's 1.166. Removing the re-capture (`stw_official_inplace`)
+  saves only ~50 ms of it: the plan and the turnover dominate, and both of those
+  Pinned-Base removes by construction.
 - LiveEPLB's worst step (66.02) sits **within jitter of not rebalancing at all** (65.99),
   while peak rank load drops 47% — and stays there on real router traces too.
 - Honest price: after a traffic shift, LiveEPLB's balance lags the synchronous variants by
