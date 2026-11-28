@@ -205,6 +205,43 @@ def local_tokens(ids, logcnt, size):
     return out
 
 
+def cluster_reduce(tpot, ctrl_ms, imbalance, split, commits, plans, bad,
+                   steps, world, rank):
+    """Merge per-rank measurements into cluster-view ones, off the clock.
+    """
+    stream = torch.tensor([tpot, ctrl_ms, imbalance], dtype=torch.float64,
+                          device="cuda")
+    dist.all_reduce(stream, op=dist.ReduceOp.MAX)
+
+    ntasks = torch.zeros(steps, dtype=torch.int64, device="cuda")
+    times = torch.zeros(steps, 4, dtype=torch.float64, device="cuda")
+    for st, n, pl, dr, cp, rc in split:
+        ntasks[st] = n
+        times[st] = torch.tensor([pl, dr, cp, rc])
+    dist.all_reduce(ntasks, op=dist.ReduceOp.SUM)
+    dist.all_reduce(times, op=dist.ReduceOp.MAX)
+    merged = [(st, int(ntasks[st]), *times[st].tolist())
+              for st in ntasks.nonzero().flatten().tolist()]
+
+    counts = torch.tensor([commits, plans], dtype=torch.int64, device="cuda")
+    dist.all_reduce(counts, op=dist.ReduceOp.MAX)
+
+    width = torch.tensor([len(bad)], dtype=torch.int64, device="cuda")
+    dist.all_reduce(width, op=dist.ReduceOp.MAX)
+    bad_all = []
+    if width.item():
+        rows = torch.full((int(width.item()), 6), -1, dtype=torch.int64,
+                          device="cuda")
+        for i, (l, e, s, (tl, te)) in enumerate(bad):
+            rows[i] = torch.tensor([rank, l, e, s, tl, te])
+        gathered = [torch.empty_like(rows) for _ in range(world)]
+        dist.all_gather(gathered, rows)
+        bad_all = [tuple(r) for g in gathered for r in g.tolist() if r[1] >= 0]
+
+    return (stream[0].tolist(), stream[1].tolist(), stream[2].tolist(),
+            merged, int(counts[0]), int(counts[1]), bad_all)
+
+
 def run(policy, args, rank, world, stack, sw):
     """Drive `stack` for args.steps decode steps under `policy`.
 
@@ -412,10 +449,14 @@ def run(policy, args, rank, world, stack, sw):
         load = rank_load(layout, ema * world, RANKS)
         imbalance.append((load.max(-1).values / load.mean(-1).clamp(min=1e-9)).mean().item())
 
+    bad = verify_replicas(stack, L)
+    tpot, ctrl_ms, imbalance, split, commits, plans, bad = cluster_reduce(
+        tpot, ctrl_ms, imbalance, split,
+        ctrl.commits if ctrl else stw_commits,
+        0 if ctrl is None else ctrl.plans, bad, args.steps, world, rank)
     return dict(policy=policy, tpot=tpot, actions=actions, imbalance=imbalance,
-                ctrl_ms=ctrl_ms, commits=ctrl.commits if ctrl else stw_commits,
-                plans=0 if ctrl is None else ctrl.plans, split=split,
-                bad=verify_replicas(stack, L))
+                ctrl_ms=ctrl_ms, commits=commits, plans=plans, split=split,
+                bad=bad)
 
 
 def stats(v):
@@ -467,11 +508,15 @@ def main():
         torch.cuda.empty_cache()
         dist.barrier()
 
+    peak = torch.tensor([torch.cuda.max_memory_allocated()],
+                        dtype=torch.float64, device="cuda")
+    dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+
     if rank == 0:
         print(f"{args.layers} layers, {args.tokens} tokens/step, {args.steps} steps, "
               f"shift at {args.shift_at}, Zipf(alpha={args.alpha}) rotating "
-              f"{args.drift} experts, peak "
-              f"{torch.cuda.max_memory_allocated() / 2**30:.1f} GiB\n")
+              f"{args.drift} experts, peak (max over ranks) "
+              f"{peak.item() / 2**30:.1f} GiB\n")
         hdr = (f"{'policy':<10}{'TPOT p50':>10}{'p99':>9}{'worst':>9}"
                f"{'Max/Mean last100':>18}{'commits':>9}")
         print(hdr)
@@ -487,14 +532,18 @@ def main():
 
         for p in policies:
             if out[p]["bad"]:
-                print(f"\n!! {p}: {len(out[p]['bad'])} replica slots hold the "
-                      f"wrong weights, first {out[p]['bad'][:3]}")
+                print(f"\n!! {p}: {len(out[p]['bad'])} replica slots across "
+                      f"all ranks hold the wrong weights "
+                      f"(rank, layer, expert, slot, got_l, got_e), first "
+                      f"{out[p]['bad'][:3]}")
             if out[p]["split"]:
                 base = torch.tensor(out["static"]["tpot"]).median().item() \
                     if "static" in out else 0.0
                 print(f"\n{p} stalls (ms). drain = waiting out the replay this "
                       f"step launched, which every step pays; plan runs on the "
-                      f"CPU beside it and is free whenever drain > 0.")
+                      f"CPU beside it and is free whenever drain > 0. slots "
+                      f"is the cluster-wide total, each time column is the "
+                      f"slowest rank's.")
                 print(f"  {'step':>5}{'slots':>7}{'plan':>8}{'drain':>8}"
                       f"{'copy':>8}{'recap':>8}{'TPOT':>8}{'vs p50':>8}")
                 for st, n, pl, dr, cp, rc in out[p]["split"]:

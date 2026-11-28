@@ -213,3 +213,48 @@ walk 慢一个量级。根因不是显存：
   它不是免费替代 staging。如果你的问题是显存而不是速度，它是正确选择；
   否则默认保持 staged。
 
+---
+
+## S5-9：报告的是 rank0 的测量，以为那就是集群的
+
+### 症状
+
+给 benchmark 加上跨 rank 聚合后重跑，"慢"的数字整组变大、"快"的几乎不动
+（40 层合成，聚合前 → 两次聚合后重跑）：stw_official worst 434 → **528 / 578**、
+stw worst → 186 / 266、stw p99 → 141 / 135（worst 属事件性指标，run 间 ±10% 正常）；
+stw 停机构成也大改（trace：recap 45-66 → 72-234 ms）。static / live 的 p50 与 worst
+基本原样。快数字不动不是没问题，是恰好没问题。
+是恰好没问题。
+
+### 根因
+
+`run()` 的全部汇总包在 `if rank == 0:` 里，tpot / ctrl_ms / split / bad / 峰值显存
+都是 rank0 一家之言，原有代码没有任何跨 rank 聚合。能瞒这么久的根因是这个测试床
+**对称性太好**：同 seed 采样让 8 个 rank 的流量逐元素一致、规划器确定、同步路径上
+有 barrier 对齐——于是 p50 层面 cluster 与 rank0 几乎一致，差异全藏在尾部，而
+EPLB 的卖点恰好就在尾部。三处真不一致：
+
+1. **live 的 staging 流量按 rank 分摊**（各 rank 只 pull 自己的任务、后台异步、
+   无 barrier），DMA 争用最重的 rank 才是集群瓶颈，rank0 分到轻活就系统性低估；
+2. **同机 8 进程抢 CPU**：planner 的 numpy/BLAS 被争抢最狠的那个 rank 决定 stw
+   关键路径上的真实停顿，rank0 的 `ctrl_ms` 不是这个数；
+3. **`bad` 只校验 rank0 自己的池**——别的 rank 搬坏权重，报告是假阴性。
+
+### 修复
+
+`cluster_reduce()`（`run_synthetic_8gpu.py`，计时循环**之后**调用，对测量路径
+零干扰）：tpot / ctrl_ms / imbalance per-step MAX；split 的槽数 SUM、时间列 MAX；
+commits / plans MAX；bad 定宽 pad 后 all_gather 并打上 rank 号；峰值显存 MAX。
+全部走 NCCL 原生支持的数值张量 collective，不碰 object collective；与 controller
+统计用的独立 gloo group 互不干扰（`controller.py:89` 本来就为躲 GPU 集合 kernel
+而选了 gloo）。
+
+### 教训
+
+- **分布式 benchmark 的默认口径是集群（最慢 rank），单 rank 视角要特别声明。**
+  集群吞吐由最慢分片决定，这点在 EP 上没有任何例外。
+- Stage 4/5 此前引用的合成数字全部是 rank0 口径；本次起文档统一为集群口径，
+  数值随之更新（以重跑为准）。
+
+---
+
